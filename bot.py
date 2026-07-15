@@ -66,6 +66,20 @@ class ParlayBot(discord.Client):
             )
             self.tree.add_command(cmd)
 
+        ml_cmd = app_commands.Command(
+            name="moneylineparlay",
+            description="Build a moneyline parlay from real starter-quality gaps + recent scoring",
+            callback=self._moneyline_callback,
+        )
+        self.tree.add_command(ml_cmd)
+
+        totals_cmd = app_commands.Command(
+            name="totalsparlay",
+            description="Rank today's run environments for over/under leans (compare vs your book's line)",
+            callback=self._totals_callback,
+        )
+        self.tree.add_command(totals_cmd)
+
         k_cmd = app_commands.Command(
             name="strikeoutsparlay",
             description="Build a pitcher-strikeouts parlay from today's real K/whiff splits",
@@ -201,6 +215,87 @@ class ParlayBot(discord.Client):
                 inline=False,
             )
         embed.set_footer(text="Research, not advice — K prop lines vary by book • Data: Baseball Savant / MLB")
+        await interaction.followup.send(embed=embed)
+
+    async def _moneyline_callback(self, interaction: discord.Interaction, legs: Literal[2, 3, 4, 5] = 3):
+        await interaction.response.defer()
+        try:
+            slate = await asyncio.to_thread(parlay.get_today_slate)
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't load today's slate: {e}")
+            return
+        if not slate:
+            await interaction.followup.send("No games on today's slate (or all finished).")
+            return
+
+        evaluated, game_of = [], {}
+        for g in slate:
+            leg = await asyncio.to_thread(parlay.evaluate_moneyline_leg, g)
+            if leg:
+                evaluated.append(leg)
+                game_of[id(leg)] = g["game_pk"]
+        if not evaluated:
+            await interaction.followup.send("No games with both probable starters qualified yet -- try closer to game time.")
+            return
+
+        chosen = parlay.pick_one_per_game(evaluated, game_of, legs)
+        embed = discord.Embed(title=f"💰 Moneyline Parlay — {len(chosen)} legs", color=discord.Color.green())
+        embed.description = "ranked by real starter xwOBA-against gap • one leg per game"
+        for i, leg in enumerate(chosen, 1):
+            lines = [
+                f"{leg['pick_starter']} xwOBA-against {leg['pick_xwoba']} vs {leg['opp_starter']} {leg['opp_xwoba']} (gap {leg['rank_metric']})",
+                f"K%: {leg['pick_k']}% vs {leg['opp_k']}%",
+            ]
+            if leg.get("pick_runs") and leg.get("opp_runs"):
+                lines.append(
+                    f"Last 10 runs/gm: {leg['pick_abbrev']} {leg['pick_runs']['runs_pg']} scored / {leg['pick_runs']['runs_allowed_pg']} allowed"
+                    f" • opp {leg['opp_runs']['runs_pg']} / {leg['opp_runs']['runs_allowed_pg']}"
+                )
+            embed.add_field(
+                name=f"Leg {i}: {leg['pick_team']} ML over {leg['opp_team']}",
+                value="\n".join(lines),
+                inline=False,
+            )
+        embed.set_footer(text="Research, not advice — starter-quality gap, not a win probability • Data: Baseball Savant / MLB")
+        await interaction.followup.send(embed=embed)
+
+    async def _totals_callback(self, interaction: discord.Interaction,
+                                lean: Literal["overs", "unders"] = "overs",
+                                legs: Literal[2, 3, 4, 5] = 3):
+        await interaction.response.defer()
+        try:
+            slate = await asyncio.to_thread(parlay.get_today_slate)
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't load today's slate: {e}")
+            return
+        if not slate:
+            await interaction.followup.send("No games on today's slate (or all finished).")
+            return
+
+        evaluated, game_of = [], {}
+        for g in slate:
+            leg = await asyncio.to_thread(parlay.evaluate_total_leg, g)
+            if leg:
+                if lean == "unders":
+                    leg["rank_metric"] = -leg["rank_metric"]  # lowest environments first
+                evaluated.append(leg)
+                game_of[id(leg)] = g["game_pk"]
+        if not evaluated:
+            await interaction.followup.send("Couldn't compute run environments yet -- try closer to game time.")
+            return
+
+        chosen = parlay.pick_one_per_game(evaluated, game_of, legs)
+        arrow = "⬆️" if lean == "overs" else "⬇️"
+        embed = discord.Embed(title=f"{arrow} Totals Leans ({lean}) — {len(chosen)} games", color=discord.Color.blue())
+        embed.description = "ranked by combined runs/gm (last 10) • starters shown for context"
+        for i, leg in enumerate(chosen, 1):
+            lines = [f"Combined recent scoring: {leg['combined_runs_pg']} runs/gm"]
+            for t in leg["teams"]:
+                s = t["starter_stats"]
+                starter_bit = f" — {t['team']['starter_name']} xwOBA-against {s['xwoba']}" if s and s.get("xwoba") is not None else ""
+                lines.append(f"{t['team']['abbrev']}: {t['runs']['runs_pg']} scored / {t['runs']['runs_allowed_pg']} allowed{starter_bit}")
+            embed.add_field(name=f"{i}. {leg['matchup']}", value="\n".join(lines), inline=False)
+        embed.set_footer(text="No betting line connected — compare these environments against YOUR book's total • Data: MLB / Baseball Savant")
         await interaction.followup.send(embed=embed)
 
     async def on_ready(self):
