@@ -67,6 +67,14 @@ class ParlayBot(discord.Client):
             )
             self.tree.add_command(cmd)
 
+        sgp_cmd = app_commands.Command(
+            name="samegameparlay",
+            description="Build a same-game parlay: 1 strikeouts leg + hit legs from one game",
+            callback=self._sgp_callback,
+        )
+        self.tree.add_command(sgp_cmd)
+        sgp_cmd.autocomplete("game")(self._game_autocomplete)
+
         ml_cmd = app_commands.Command(
             name="moneylineparlay",
             description="Build a moneyline parlay from real starter-quality gaps + recent scoring",
@@ -216,6 +224,69 @@ class ParlayBot(discord.Client):
                 inline=False,
             )
         embed.set_footer(text="Research, not advice — K prop lines vary by book • Data: Baseball Savant / MLB")
+        await interaction.followup.send(embed=embed)
+
+    async def _game_autocomplete(self, interaction: discord.Interaction, current: str):
+        try:
+            slate = await asyncio.to_thread(parlay.get_today_slate)
+        except Exception:
+            return []
+        choices = []
+        cur = current.lower()
+        for g in slate:
+            label = f"{g['teams']['away']['abbrev']} @ {g['teams']['home']['abbrev']}"
+            if cur in label.lower():
+                choices.append(app_commands.Choice(name=label, value=str(g["game_pk"])))
+            if len(choices) >= 25:
+                break
+        return choices
+
+    async def _sgp_callback(self, interaction: discord.Interaction, game: str,
+                             legs: Literal[2, 3, 4, 5] = 3):
+        await interaction.response.defer()
+        try:
+            slate = await asyncio.to_thread(parlay.get_today_slate)
+        except Exception as e:
+            await interaction.followup.send(f"Couldn't load today's slate: {e}")
+            return
+        target = next((g for g in slate if str(g["game_pk"]) == game), None)
+        if target is None:
+            await interaction.followup.send("Couldn't find that game on today's slate -- pick one from the dropdown.")
+            return
+
+        cands = await asyncio.to_thread(parlay.sgp_candidates, target)
+        chosen = []
+        if cands["k_legs"]:
+            chosen.append(("k", cands["k_legs"][0]))
+        for hit in cands["hit_legs"]:
+            if len(chosen) >= legs:
+                break
+            chosen.append(("hit", hit))
+
+        if len(chosen) < 2:
+            await interaction.followup.send(
+                "Not enough qualified legs in this game yet (starters unannounced or thin samples) -- try closer to game time."
+            )
+            return
+
+        matchup = f"{target['teams']['away']['abbrev']} @ {target['teams']['home']['abbrev']}"
+        embed = discord.Embed(title=f"🎰 Same Game Parlay — {matchup}", color=discord.Color.purple())
+        embed.description = "structure: best strikeouts leg + top hit legs (xBA vs hand) • all one game"
+        for i, (kind, leg) in enumerate(chosen, 1):
+            if kind == "k":
+                embed.add_field(
+                    name=f"Leg {i}: {leg['starter']} strikeouts ({leg['team']})",
+                    value=(f"K%: {leg['k_pct_vs_l']}% vs L | {leg['k_pct_vs_r']}% vs R\n"
+                           f"Whiff%: {leg['whiff_vs_l']}% vs L | {leg['whiff_vs_r']}% vs R"),
+                    inline=False,
+                )
+            else:
+                embed.add_field(
+                    name=f"Leg {i}: {leg['batter']} ({leg['team']}) to record a hit",
+                    value=_leg_lines(leg, "hit"),
+                    inline=False,
+                )
+        embed.set_footer(text="SGP legs are correlated — books price them together, so no combined odds shown • Research, not advice")
         await interaction.followup.send(embed=embed)
 
     async def _moneyline_callback(self, interaction: discord.Interaction, legs: Literal[2, 3, 4, 5] = 3):
