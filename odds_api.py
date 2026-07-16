@@ -20,7 +20,9 @@ API_KEY = os.getenv("ODDS_API_KEY")
 BASE = "https://api.the-odds-api.com/v4/sports/baseball_mlb/odds"
 
 _cache: dict = {}
-CACHE_SECONDS = 1800  # 30 min -- odds move, but not enough to matter here
+CACHE_SECONDS = 300  # 5 min -- "best book in the moment": prices at
+# command time are at most a few minutes old; repeat runs inside the
+# window share one fetch, keeping credit burn modest on the 100K tier
 
 
 def get_mlb_odds(markets: str = "h2h") -> list[dict]:
