@@ -47,6 +47,32 @@ def _leg_lines(leg: dict, market: str) -> str:
     return "\n".join(lines)
 
 
+def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay") -> tuple[str, list]:
+    """The ticket treatment every command shares: exact combined price in
+    the header for cross-game parlays (real math), NO number for same-game
+    (only the book knows its SGP price), and full-slip/build-slip buttons."""
+    by_book = odds_api.parlay_by_book(priced_legs)
+    if not by_book:
+        return "", []
+    slips = odds_api.parlay_slips(priced_legs, by_book)
+    if same_game:
+        header = "🎟️ **Same-game parlay** — tap a book below to load the full slip; the book shows its exact SGP price there\n\n"
+    else:
+        best = max(by_book, key=lambda bk: by_book[bk]["combined"])
+        header = f"🎟️ **{verb} pays {by_book[best]['combined']:+d}** best @ {best}\n\n"
+    buttons = []
+    for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"]):
+        url = slips.get(bk) or by_book[bk]["link"]
+        if not url:
+            continue
+        if bk in slips:
+            label = f"Full slip @ {bk}" if same_game else f"Full slip @ {bk} {by_book[bk]['combined']:+d}"
+        else:
+            label = f"{bk} (build slip)" if same_game else f"{bk} {by_book[bk]['combined']:+d} (build slip)"
+        buttons.append((label, url))
+    return header, buttons[:5]
+
+
 def build_bet_buttons(leg_links: list[tuple[str, str]]) -> discord.ui.View | None:
     """Link buttons: [('Leg 1: Soto @ BetRivers', url), ...]. Discord caps
     at 25 buttons; we stay well under. None if no book gave us links."""
@@ -224,18 +250,10 @@ class ParlayBot(discord.Client):
         priced_legs = []
         for leg in chosen:
             priced_legs.append(leg.get("_priced") or await asyncio.to_thread(_price_leg, leg))
-        by_book = odds_api.parlay_by_book(priced_legs)
-        slips = odds_api.parlay_slips(priced_legs, by_book)
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
+        header, bet_buttons = parlay_ticket(priced_legs, same_game)
 
         embed = discord.Embed(title=f"{cfg['title']} — {len(chosen)} legs", color=discord.Color.gold())
-        header = ""
-        if by_book:
-            if same_game:
-                header = "🎟️ **Same-game parlay** — tap a book below to load the full slip; the book shows its exact SGP price there\n\n"
-            else:
-                best_book = max(by_book, key=lambda bk: by_book[bk]["combined"])
-                header = f"🎟️ **Parlay pays {by_book[best_book]['combined']:+d}** best @ {best_book}\n\n"
         embed.description = header + cfg["note"] + " • best legs win, any game"
         for i, leg in enumerate(chosen, 1):
             embed.add_field(
@@ -244,17 +262,7 @@ class ParlayBot(discord.Client):
                 inline=False,
             )
         embed.set_footer(text="Research, not advice — confirm lineups before betting • Data: Baseball Savant / MLB / The Odds API")
-        bet_buttons = []
-        for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"]):
-            url = slips.get(bk) or by_book[bk]["link"]
-            if not url:
-                continue
-            if bk in slips:
-                label = f"Full slip @ {bk}" if same_game else f"Full slip @ {bk} {by_book[bk]['combined']:+d}"
-            else:
-                label = f"{bk} (build slip)" if same_game else f"{bk} {by_book[bk]['combined']:+d} (build slip)"
-            bet_buttons.append((label, url))
-        view = build_bet_buttons(bet_buttons[:5])
+        view = build_bet_buttons(bet_buttons)
         if view:
             await interaction.followup.send(embed=embed, view=view)
         else:
@@ -307,18 +315,10 @@ class ParlayBot(discord.Client):
             priced_legs.append(priced)
             if priced:
                 k_lines[id(leg)] = priced["point"]
-        by_book = odds_api.parlay_by_book(priced_legs)
-        slips = odds_api.parlay_slips(priced_legs, by_book)
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
+        header, bet_buttons = parlay_ticket(priced_legs, same_game, verb="Overs parlay")
 
         embed = discord.Embed(title=f"⚔️ Strikeouts Parlay — {len(chosen)} legs", color=discord.Color.red())
-        header = ""
-        if by_book:
-            if same_game:
-                header = "🎟️ **Same-game parlay** — tap a book below to load the full slip; the book shows its exact SGP price there\n\n"
-            else:
-                best_book = max(by_book, key=lambda bk: by_book[bk]["combined"])
-                header = f"🎟️ **Overs parlay pays {by_book[best_book]['combined']:+d}** best @ {best_book}\n\n"
         embed.description = header + "ranked by real K% vs either side"
         for i, leg in enumerate(chosen, 1):
             value = (f"K%: {leg['k_pct_vs_l']}% vs L | {leg['k_pct_vs_r']}% vs R\n"
@@ -331,17 +331,7 @@ class ParlayBot(discord.Client):
                 value=value,
                 inline=False,
             )
-        bet_buttons = []
-        for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"]):
-            url = slips.get(bk) or by_book[bk]["link"]
-            if not url:
-                continue
-            if bk in slips:
-                label = f"Full slip @ {bk}" if same_game else f"Full slip @ {bk} {by_book[bk]['combined']:+d}"
-            else:
-                label = f"{bk} (build slip)" if same_game else f"{bk} {by_book[bk]['combined']:+d} (build slip)"
-            bet_buttons.append((label, url))
-        bet_buttons = bet_buttons[:5]
+
         embed.set_footer(text="Research, not advice — K prop lines vary by book • Data: Baseball Savant / MLB / The Odds API")
         view = build_bet_buttons(bet_buttons)
         if view:
@@ -370,16 +360,40 @@ class ParlayBot(discord.Client):
             return
 
         chosen = parlay.pick_legs(legs_found, game_of, legs)
+
+        game_names = {g["game_pk"]: (g["teams"]["home"]["name"], g["teams"]["away"]["name"]) for g in slate}
+        events = await asyncio.to_thread(odds_api.get_events)
+
+        def _price_streak_leg(leg):
+            names = game_names.get(game_of.get(id(leg)))
+            if not names or not events:
+                return None
+            ev = odds_api.find_event(events, names[0], names[1])
+            if not ev:
+                return None
+            props = odds_api.get_event_props(ev.get("id"), "batter_hits")
+            return odds_api.player_prop_prices(props, "batter_hits", leg["batter"]) if props else None
+
+        priced_legs = []
+        for leg in chosen:
+            priced_legs.append(await asyncio.to_thread(_price_streak_leg, leg))
+        same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
+        header, bet_buttons = parlay_ticket(priced_legs, same_game)
+
         embed = discord.Embed(title=f"🔥 Streak Parlay — {len(chosen)} legs (streaks of {min_streak}+)", color=discord.Color.orange())
-        embed.description = "each leg = hitter to extend their ACTIVE hit streak • ranked by streak length"
+        embed.description = header + "each leg = hitter to extend their ACTIVE hit streak • ranked by streak length"
         for i, leg in enumerate(chosen, 1):
             embed.add_field(
                 name=f"Leg {i}: {leg['batter']} ({leg['team']}) — 🔥 {leg['streak']}-game hit streak",
                 value=_leg_lines(leg, "hit"),
                 inline=False,
             )
-        embed.set_footer(text="Streaks computed from real game logs • Research, not advice — confirm lineups • Data: Baseball Savant / MLB")
-        await interaction.followup.send(embed=embed)
+        embed.set_footer(text="Streaks computed from real game logs • Research, not advice — confirm lineups • Data: Baseball Savant / MLB / The Odds API")
+        view = build_bet_buttons(bet_buttons)
+        if view:
+            await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.followup.send(embed=embed)
 
     async def _game_autocomplete(self, interaction: discord.Interaction, current: str):
         try:
@@ -425,8 +439,25 @@ class ParlayBot(discord.Client):
             return
 
         matchup = f"{target['teams']['away']['abbrev']} @ {target['teams']['home']['abbrev']}"
+
+        events = await asyncio.to_thread(odds_api.get_events)
+        ev = odds_api.find_event(events, target["teams"]["home"]["name"], target["teams"]["away"]["name"]) if events else None
+
+        def _price_sgp_leg(kind, leg):
+            if not ev:
+                return None
+            market_key = "pitcher_strikeouts" if kind == "k" else "batter_hits"
+            player = leg["starter"] if kind == "k" else leg["batter"]
+            props = odds_api.get_event_props(ev.get("id"), market_key)
+            return odds_api.player_prop_prices(props, market_key, player) if props else None
+
+        priced_legs = []
+        for kind, leg in chosen:
+            priced_legs.append(await asyncio.to_thread(_price_sgp_leg, kind, leg))
+        header, bet_buttons = parlay_ticket(priced_legs, same_game=True)
+
         embed = discord.Embed(title=f"🎰 Same Game Parlay — {matchup}", color=discord.Color.purple())
-        embed.description = "structure: best strikeouts leg + top hit legs (xBA vs hand) • all one game"
+        embed.description = header + "structure: best strikeouts leg + top hit legs (xBA vs hand) • all one game"
         for i, (kind, leg) in enumerate(chosen, 1):
             if kind == "k":
                 embed.add_field(
@@ -441,8 +472,12 @@ class ParlayBot(discord.Client):
                     value=_leg_lines(leg, "hit"),
                     inline=False,
                 )
-        embed.set_footer(text="SGP legs are correlated — books price them together, so no combined odds shown • Research, not advice")
-        await interaction.followup.send(embed=embed)
+        embed.set_footer(text="SGP legs are correlated — the book shows its exact price on the slip • Research, not advice • Data: Baseball Savant / MLB / The Odds API")
+        view = build_bet_buttons(bet_buttons)
+        if view:
+            await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.followup.send(embed=embed)
 
     async def _moneyline_callback(self, interaction: discord.Interaction, legs: LegsT = 3,
                                    min_odds: int = None, max_odds: int = None):
@@ -489,17 +524,13 @@ class ParlayBot(discord.Client):
         for leg in chosen:
             event = odds_api.find_event(odds_events, leg["pick_team"], leg["opp_team"]) if odds_events else None
             if event:
-                prices, links = odds_api.all_prices_and_links(event, "h2h", leg["pick_team"])
-                priced_legs.append({"prices": prices, "links": links} if prices else None)
+                prices, links, sids = odds_api.all_prices_and_links(event, "h2h", leg["pick_team"])
+                priced_legs.append({"prices": prices, "links": links, "sids": sids} if prices else None)
             else:
                 priced_legs.append(None)
-        by_book = odds_api.parlay_by_book(priced_legs)
+        header, bet_buttons = parlay_ticket(priced_legs, same_game=False)
 
         embed = discord.Embed(title=f"💰 Moneyline Parlay — {len(chosen)} legs", color=discord.Color.green())
-        header = ""
-        if by_book:
-            best_book = max(by_book, key=lambda bk: by_book[bk]["combined"])
-            header = f"🎟️ **Parlay pays {by_book[best_book]['combined']:+d}** best @ {best_book}\n\n"
         embed.description = header + "ranked by real starter xwOBA-against gap • one leg per game"
         for i, leg in enumerate(chosen, 1):
             lines = [
@@ -517,17 +548,7 @@ class ParlayBot(discord.Client):
                 inline=False,
             )
         embed.set_footer(text="Research, not advice — starter-quality gap, not a win probability • Data: Baseball Savant / MLB / The Odds API")
-        bet_buttons = []
-        for bk in sorted(by_book, key=lambda bk: -by_book[bk]["combined"]):
-            url = slips.get(bk) or by_book[bk]["link"]
-            if not url:
-                continue
-            if bk in slips:
-                label = f"Full slip @ {bk}" if same_game else f"Full slip @ {bk} {by_book[bk]['combined']:+d}"
-            else:
-                label = f"{bk} (build slip)" if same_game else f"{bk} {by_book[bk]['combined']:+d} (build slip)"
-            bet_buttons.append((label, url))
-        bet_buttons = bet_buttons[:5]
+
         view = build_bet_buttons(bet_buttons)
         if view:
             await interaction.followup.send(embed=embed, view=view)
@@ -564,18 +585,29 @@ class ParlayBot(discord.Client):
         arrow = "⬆️" if lean == "overs" else "⬇️"
         embed = discord.Embed(title=f"{arrow} Totals Leans ({lean}) — {len(chosen)} games", color=discord.Color.blue())
         embed.description = "ranked by combined runs/gm (last 10) • starters shown for context"
-        for i, leg in enumerate(chosen, 1):
-            lines = [f"Combined recent scoring: {leg['combined_runs_pg']} runs/gm"]
+        priced_legs = []
+        side_name = "Over" if lean == "overs" else "Under"
+        for leg in chosen:
+            priced = None
             if odds_events:
                 names = [t["team"]["name"] for t in leg["teams"]]
                 event = odds_api.find_event(odds_events, names[0], names[1])
                 if event:
                     tl = odds_api.totals_line(event)
                     if tl:
-                        side_prices = tl["over"] if lean == "overs" else tl["under"]
-                        bp = odds_api.best_price(side_prices)
-                        bp_str = f" ({lean[:-1]} {bp[1]:+d} @ {bp[0]})" if bp else ""
-                        lines.append(f"Posted line: {tl['point']}{bp_str}")
+                        leg["_point"] = tl["point"]
+                        prices, links, sids = odds_api.all_prices_and_links(event, "totals", side_name, point=tl["point"])
+                        if prices:
+                            priced = {"prices": prices, "links": links, "sids": sids}
+            priced_legs.append(priced)
+        header, bet_buttons = parlay_ticket(priced_legs, same_game=False, verb=f"{side_name}s parlay")
+        if header:
+            embed.description = header + embed.description
+
+        for i, leg in enumerate(chosen, 1):
+            lines = [f"Combined recent scoring: {leg['combined_runs_pg']} runs/gm"]
+            if leg.get("_point") is not None:
+                lines.append(f"Bet: {side_name.lower()} {leg['_point']} total runs")
             for t in leg["teams"]:
                 s = t["starter_stats"]
                 starter_bit = f" — {t['team']['starter_name']} xwOBA-against {s['xwoba']}" if s and s.get("xwoba") is not None else ""
@@ -584,7 +616,11 @@ class ParlayBot(discord.Client):
         footer = ("Data: MLB / Baseball Savant / The Odds API" if odds_events
                   else "No totals lines on current odds plan — compare vs your book • Data: MLB / Baseball Savant")
         embed.set_footer(text=footer)
-        await interaction.followup.send(embed=embed)
+        view = build_bet_buttons(bet_buttons)
+        if view:
+            await interaction.followup.send(embed=embed, view=view)
+        else:
+            await interaction.followup.send(embed=embed)
 
     async def on_ready(self):
         log.info("Logged in as %s", self.user)
