@@ -173,19 +173,69 @@ class ParlayBot(discord.Client):
             await interaction.followup.send("Couldn't build qualified legs from today's matchups.")
             return
 
+        # Prop odds: match each leg's game to an odds event, price the prop
+        game_names = {g["game_pk"]: (g["teams"]["home"]["name"], g["teams"]["away"]["name"]) for g in slate}
+        events = await asyncio.to_thread(odds_api.get_events)
+        market_key = odds_api.PROP_MARKETS.get(market)
+
+        def _price_leg(leg):
+            gpk = game_of.get(id(leg))
+            names = game_names.get(gpk)
+            if not names or not events or not market_key:
+                return None
+            ev = odds_api.find_event(events, names[0], names[1])
+            if not ev:
+                return None
+            props = odds_api.get_event_props(ev.get("id"), market_key)
+            return odds_api.player_prop_prices(props, market_key, leg["batter"]) if props else None
+
+        if min_odds is not None or max_odds is not None:
+            filtered = []
+            for leg in evaluated:
+                priced = await asyncio.to_thread(_price_leg, leg)
+                bp = odds_api.best_price(priced["prices"]) if priced else None
+                if bp is None:
+                    continue
+                if min_odds is not None and bp[1] < min_odds:
+                    continue
+                if max_odds is not None and bp[1] > max_odds:
+                    continue
+                leg["_priced"] = priced
+                filtered.append(leg)
+            evaluated = filtered
+            if not evaluated:
+                await interaction.followup.send("No legs fit that odds range today (or props unpriced yet -- lines post closer to game time).")
+                return
+
         chosen = parlay.pick_legs(evaluated, game_of, legs)
 
         embed = discord.Embed(title=f"{cfg['title']} — {len(chosen)} legs", color=discord.Color.gold())
         embed.description = cfg["note"] + " • best legs win, any game"
-        if min_odds is not None or max_odds is not None:
-            embed.description += "\n(odds filters apply once prop pricing is on your Odds API plan)"
+        best_leg_prices = []
+        leg_games = set()
         for i, leg in enumerate(chosen, 1):
+            value = _leg_lines(leg, market)
+            priced = leg.get("_priced") or await asyncio.to_thread(_price_leg, leg)
+            if priced:
+                label = "to record a hit" if market == "hit" else ("to homer" if market == "hr" else f"over {priced['point']}")
+                value += f"\nOdds ({label}): " + odds_api.format_prices(priced["prices"])
+                bp = odds_api.best_price(priced["prices"])
+                if bp:
+                    best_leg_prices.append(bp[1])
+                    leg_games.add(game_of.get(id(leg)))
             embed.add_field(
                 name=f"Leg {i}: {leg['batter']} ({leg['team']})",
-                value=_leg_lines(leg, market),
+                value=value,
                 inline=False,
             )
-        embed.set_footer(text="Research, not advice — confirm lineups before betting • Data: Baseball Savant / MLB")
+        if len(best_leg_prices) == len(chosen) and best_leg_prices:
+            if len(leg_games) == len(chosen):
+                combo = odds_api.parlay_price(best_leg_prices)
+                if combo is not None:
+                    embed.add_field(name="Parlay at best prices", value=f"**{combo:+d}**", inline=False)
+            else:
+                embed.add_field(name="Parlay pricing", value="Includes same-game legs — your book prices the correlation, so no naive multiplied payout shown.", inline=False)
+        embed.set_footer(text="Research, not advice — confirm lineups before betting • Data: Baseball Savant / MLB / The Odds API")
         await interaction.followup.send(embed=embed)
 
     async def _strikeouts_callback(self, interaction: discord.Interaction, legs: LegsT = 3):
@@ -220,15 +270,26 @@ class ParlayBot(discord.Client):
             return
 
         chosen = parlay.pick_legs(evaluated, game_of, legs)
+        game_names = {g["game_pk"]: (g["teams"]["home"]["name"], g["teams"]["away"]["name"]) for g in slate}
+        events = await asyncio.to_thread(odds_api.get_events)
 
         embed = discord.Embed(title=f"⚔️ Strikeouts Parlay — {len(chosen)} legs", color=discord.Color.red())
         embed.description = "ranked by real K% vs either side"
         for i, leg in enumerate(chosen, 1):
+            value = (f"K%: {leg['k_pct_vs_l']}% vs L | {leg['k_pct_vs_r']}% vs R\n"
+                     f"Whiff%: {leg['whiff_vs_l']}% vs L | {leg['whiff_vs_r']}% vs R\n"
+                     f"{leg['pa']} PA faced this season")
+            names = game_names.get(game_of.get(id(leg)))
+            if names and events:
+                ev = odds_api.find_event(events, names[0], names[1])
+                if ev:
+                    props = await asyncio.to_thread(odds_api.get_event_props, ev.get("id"), "pitcher_strikeouts")
+                    priced = odds_api.player_prop_prices(props, "pitcher_strikeouts", leg["starter"]) if props else None
+                    if priced:
+                        value += f"\nK line {priced['point']} — over: " + odds_api.format_prices(priced["prices"])
             embed.add_field(
                 name=f"Leg {i}: {leg['starter']} ({leg['team']}) vs {leg['opponent']}",
-                value=(f"K%: {leg['k_pct_vs_l']}% vs L | {leg['k_pct_vs_r']}% vs R\n"
-                       f"Whiff%: {leg['whiff_vs_l']}% vs L | {leg['whiff_vs_r']}% vs R\n"
-                       f"{leg['pa']} PA faced this season"),
+                value=value,
                 inline=False,
             )
         embed.set_footer(text="Research, not advice — K prop lines vary by book • Data: Baseball Savant / MLB")
