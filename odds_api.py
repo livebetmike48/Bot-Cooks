@@ -35,7 +35,7 @@ def get_mlb_odds(markets: str = "h2h") -> list[dict]:
     try:
         resp = requests.get(
             BASE,
-            params={"apiKey": API_KEY, "regions": "us", "markets": markets, "oddsFormat": "american", "includeLinks": "true"},
+            params={"apiKey": API_KEY, "regions": "us", "markets": markets, "oddsFormat": "american", "includeLinks": "true", "includeSids": "true"},
             timeout=20,
         )
         if resp.status_code != 200:
@@ -244,7 +244,7 @@ def get_event_props(event_id: str, market_key: str) -> dict | None:
     try:
         resp = requests.get(
             f"{EVENTS_BASE}/{event_id}/odds",
-            params={"apiKey": API_KEY, "regions": "us", "markets": market_key, "oddsFormat": "american", "includeLinks": "true"},
+            params={"apiKey": API_KEY, "regions": "us", "markets": market_key, "oddsFormat": "american", "includeLinks": "true", "includeSids": "true"},
             timeout=20,
         )
         if resp.status_code != 200:
@@ -282,12 +282,13 @@ def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> d
                 if not desc or (target not in desc and target_last not in desc):
                     continue
                 pt = outcome.get("point")
-                bucket = by_point.setdefault(pt, {"prices": {}, "links": {}})
+                bucket = by_point.setdefault(pt, {"prices": {}, "links": {}, "sids": {}})
                 title = book.get("title", "?")
                 bucket["prices"][title] = outcome.get("price")
                 link = _clean_link(outcome.get("link") or market.get("link") or book.get("link"))
                 if link:
                     bucket["links"][title] = link
+                bucket["sids"][title] = {"market": market.get("sid"), "outcome": outcome.get("sid")}
     if not by_point:
         return None
     # Hits/HR: want the 0.5 line when present; otherwise most-quoted point
@@ -296,7 +297,7 @@ def player_prop_prices(event_data: dict, market_key: str, player_name: str) -> d
     else:
         point = max(by_point, key=lambda p: len(by_point[p]["prices"]))
     chosen = by_point[point]
-    return {"point": point, "prices": chosen["prices"], "links": chosen["links"]}
+    return {"point": point, "prices": chosen["prices"], "links": chosen["links"], "sids": chosen["sids"]}
 
 
 def parlay_by_book(priced_legs: list[dict]) -> dict:
@@ -320,3 +321,66 @@ def parlay_by_book(priced_legs: list[dict]) -> dict:
                 break
         out[book] = {"combined": decimal_to_american(dec), "link": link}
     return out
+
+
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse, quote
+
+
+def build_slip_link(book_title: str, legs: list[dict]) -> str | None:
+    """A single URL that loads ALL legs into the book's betslip, using the
+    bookmaker's own ids (sids). Formats are the community-known ones that
+    odds tools use -- unofficial, so anything unbuildable returns None and
+    callers fall back to single-leg links."""
+    folded = _fold(book_title)
+    if "fanduel" in folded:
+        # FanDuel addToBetslip supports multiple selections, cross-event
+        params = []
+        for i, leg in enumerate(legs):
+            sid = (leg or {}).get("sid") or {}
+            market_id, selection_id = sid.get("market"), sid.get("outcome")
+            if not market_id or not selection_id:
+                return None
+            params.append((f"marketId[{i}]", market_id))
+            params.append((f"selectionId[{i}]", selection_id))
+        return "https://sportsbook.fanduel.com/addToBetslip?" + urlencode(params)
+    if "draftkings" in folded:
+        # DK event links carry ?outcomes= -- multiple picks joinable with +
+        # (single event only, i.e. same-game parlays)
+        links = [(leg or {}).get("link") for leg in legs]
+        if not all(links):
+            return None
+        parsed = [urlparse(l) for l in links]
+        if len({(p.scheme, p.netloc, p.path) for p in parsed}) != 1:
+            return None  # cross-event: no known DK multi-link format
+        outcome_ids = []
+        for p in parsed:
+            q = parse_qs(p.query)
+            vals = q.get("outcomes")
+            if not vals:
+                return None
+            outcome_ids.extend(vals[0].split(" "))
+        base = parsed[0]
+        query = "outcomes=" + quote("+".join(dict.fromkeys(outcome_ids)), safe="+")
+        return urlunparse((base.scheme, base.netloc, base.path, "", query, ""))
+    return None
+
+
+def parlay_slips(priced_legs: list[dict], by_book: dict) -> dict:
+    """{book: slip_url} for books where a full multi-leg slip link can be
+    built from every leg's sid/link at that book."""
+    out = {}
+    for book in by_book:
+        legs = []
+        ok = True
+        for p in priced_legs:
+            if not p:
+                ok = False
+                break
+            legs.append({"sid": (p.get("sids") or {}).get(book),
+                         "link": (p.get("links") or {}).get(book)})
+        if not ok:
+            continue
+        slip = build_slip_link(book, legs)
+        if slip:
+            out[book] = _clean_link(slip)
+    return {k: v for k, v in out.items() if v}
