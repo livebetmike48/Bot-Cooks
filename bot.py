@@ -235,11 +235,13 @@ class ParlayBot(discord.Client):
 
         if min_odds is not None or max_odds is not None:
             filtered = []
+            seen_prices = []
             for leg in evaluated:
                 priced = await asyncio.to_thread(_price_leg, leg)
                 bp = odds_api.best_price(priced["prices"]) if priced else None
                 if bp is None:
                     continue
+                seen_prices.append(bp[1])
                 if min_odds is not None and bp[1] < min_odds:
                     continue
                 if max_odds is not None and bp[1] > max_odds:
@@ -248,7 +250,18 @@ class ParlayBot(discord.Client):
                 filtered.append(leg)
             evaluated = filtered
             if not evaluated:
-                await interaction.followup.send("No legs fit that odds range today (or props unpriced yet -- lines post closer to game time).")
+                if seen_prices:
+                    lo, hi = min(seen_prices), max(seen_prices)
+                    await interaction.followup.send(
+                        f"No legs fit that odds range — the {len(seen_prices)} priced legs today ran "
+                        f"**{lo:+d} to {hi:+d}**. Widen the range (or drop min/max) to see them. "
+                        f"Heads up: hit props on top hitters usually live around -250 to -400."
+                    )
+                else:
+                    await interaction.followup.send(
+                        "No legs have live prices right now — props are unposted or suspended "
+                        "(books pull props once games go live; tonight's lines post closer to game time)."
+                    )
                 return
 
         chosen = parlay.pick_legs(evaluated, game_of, legs)
@@ -511,11 +524,13 @@ class ParlayBot(discord.Client):
         odds_events = await asyncio.to_thread(odds_api.get_mlb_odds, "h2h")
         if odds_events and (min_odds is not None or max_odds is not None):
             filtered = []
+            seen_prices = []
             for leg in evaluated:
                 event = odds_api.find_event(odds_events, leg["pick_team"], leg["opp_team"])
                 bp = odds_api.best_price(odds_api.all_prices(event, "h2h", leg["pick_team"])) if event else None
                 if bp is None:
                     continue
+                seen_prices.append(bp[1])
                 if min_odds is not None and bp[1] < min_odds:
                     continue
                 if max_odds is not None and bp[1] > max_odds:
@@ -523,7 +538,14 @@ class ParlayBot(discord.Client):
                 filtered.append(leg)
             evaluated = filtered
             if not evaluated:
-                await interaction.followup.send("No moneyline legs fit that odds range today.")
+                if seen_prices:
+                    lo, hi = min(seen_prices), max(seen_prices)
+                    await interaction.followup.send(
+                        f"No moneyline legs fit that odds range — the {len(seen_prices)} priced legs today ran "
+                        f"**{lo:+d} to {hi:+d}**. Widen the range (or drop min/max) to see them."
+                    )
+                else:
+                    await interaction.followup.send("No moneyline legs have live prices right now.")
                 return
         chosen = parlay.pick_legs(evaluated, game_of, legs, max_per_game=1)
 
