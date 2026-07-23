@@ -79,6 +79,13 @@ EV_ALERT_MIN_PCT = float(os.getenv("EV_ALERT_MIN_PCT", "15.0"))
 # (~49K/month) on top of the two pick scans -- fits a 100K/month plan with
 # room for the site's other usage. Tighten at your own credit budget.
 EV_ALERT_POLL_MINUTES = int(os.getenv("EV_ALERT_POLL_MINUTES", "120"))
+# Consensus reliability (July 23, after the Bogaerts false alert): a line
+# only counts as having a real consensus when >=2 books quote BOTH sides
+# AND their de-vigged fair values agree within this many percentage
+# points. One stale book among the both-sided quotes can otherwise
+# manufacture a fake 20%+ "edge" on prices that are just the market.
+EV_MIN_CONSENSUS_BOOKS = int(os.getenv("EV_MIN_CONSENSUS_BOOKS", "2"))
+EV_MAX_FAIR_SPREAD = float(os.getenv("EV_MAX_FAIR_SPREAD", "6.0"))
 
 def _parse_pick_times() -> list[dtime]:
     """EV_PICK_TIMES_UTC: comma-separated HH:MM UTC times. Default
@@ -423,6 +430,9 @@ def _compute_ev_rows(groups: list[dict]) -> list[dict]:
             s: sum(f[s] for f in per_book_fair.values()) / len(per_book_fair)
             for s in (s1, s2)
         }
+        fairs_s1 = [f[s1] for f in per_book_fair.values()]
+        fair_spread = round((max(fairs_s1) - min(fairs_s1)) * 100, 2)
+        n_consensus = len(per_book_fair)
 
         for book_name, prices in books.items():
             for side, price in prices.items():
@@ -436,6 +446,8 @@ def _compute_ev_rows(groups: list[dict]) -> list[dict]:
                     "side": side, "book": book_name, "price": price,
                     "fair_prob_pct": round(fair_prob * 100, 2),
                     "ev_pct": round(_ev_percent(fair_prob, price), 2),
+                    "consensus_books": n_consensus,
+                    "fair_spread": fair_spread,
                 })
     rows.sort(key=lambda r: -r["ev_pct"])
     return rows
@@ -620,7 +632,7 @@ async def _post_nightly_pick() -> str:
 
     # The honest-tracker gate: no play clearing EV_MIN_PCT means NO BET --
     # never force a vig-priced ticket into the ledger just to post something.
-    rows = [r for r in rows if r["ev_pct"] >= EV_MIN_PCT]
+    rows = [r for r in rows if r["ev_pct"] >= EV_MIN_PCT and _consensus_reliable(r)]
     if not rows:
         await channel.send(
             f"📭 No play clears the **+{EV_MIN_PCT:g}% EV** bar this scan — no bet. "
@@ -714,30 +726,51 @@ async def _grade_pending():
             log.error("Failed to post EV recap: %s", e)
 
 
+def _consensus_reliable(r: dict) -> bool:
+    return (r.get("consensus_books", 0) >= EV_MIN_CONSENSUS_BOOKS
+            and r.get("fair_spread", 999) <= EV_MAX_FAIR_SPREAD)
+
+
 async def _check_and_post_alerts(rows: list[dict], channel):
-    """Posts a 🚨 alert for every play at/above EV_ALERT_MIN_PCT not yet
-    alerted today. Any MLB market qualifies. Deduped per (day, line, book)."""
+    """ONE alert per line (not per book): fires when the best book on a
+    line clears EV_ALERT_MIN_PCT, and shows the FULL board across books so
+    a split market / stale line is visible at a glance. Deduped per
+    (day, line) with a '*' book sentinel."""
     if channel is None:
         return
     today = _et_date_str(0)
+    board: dict[tuple, list] = {}
     for r in rows:
-        if r["ev_pct"] < EV_ALERT_MIN_PCT:
-            break  # rows are sorted best-first
-        if _alert_already_sent(today, r["market_key"], r["player"], r["point"], r["side"], r["book"]):
+        board.setdefault((r["market_key"], r["player"], r["point"], r["side"]), []).append(r)
+
+    for (mk, player, point, side), group in board.items():
+        best = max(group, key=lambda r: r["ev_pct"])
+        if best["ev_pct"] < EV_ALERT_MIN_PCT:
             continue
+        if not _consensus_reliable(best):
+            log.info("Skipping alert on disputed line %s %s (books=%s, fair spread=%.1f pts)",
+                     best["player"] or best["matchup"], _play_desc(best),
+                     best.get("consensus_books"), best.get("fair_spread", -1))
+            continue
+        if _alert_already_sent(today, mk, player, point, side, "*"):
+            continue
+        prices_line = " • ".join(
+            f"{g['book']} {g['price']:+d}" for g in sorted(group, key=lambda x: -x["ev_pct"])
+        )
         embed = discord.Embed(
-            title=f"🚨 {r['ev_pct']:+.1f}% EV ALERT",
+            title=f"🚨 {best['ev_pct']:+.1f}% EV ALERT",
             color=discord.Color.red(),
         )
-        embed.add_field(name="Play", value=f"{_play_desc(r)} — {r['player'] or r['matchup']}", inline=False)
-        embed.add_field(name="Market", value=r["market_label"], inline=True)
-        embed.add_field(name="Book", value=f"{r['book']} ({r['price']:+d})", inline=True)
-        embed.add_field(name="Consensus Fair", value=f"{r['fair_prob_pct']}%", inline=True)
-        embed.set_footer(text=f"Edges this large are rare and often mean a stale or just-suspended line — verify it's still live before betting. Alert bar: {EV_ALERT_MIN_PCT:g}%+")
+        embed.add_field(name="Play", value=f"{_play_desc(best)} — {best['player'] or best['matchup']}", inline=False)
+        embed.add_field(name="Market", value=best["market_label"], inline=True)
+        embed.add_field(name="Best Price", value=f"{best['book']} ({best['price']:+d})", inline=True)
+        embed.add_field(name="Consensus Fair", value=f"{best['fair_prob_pct']}%", inline=True)
+        embed.add_field(name="Full Board", value=prices_line, inline=False)
+        embed.set_footer(text=f"Edges this large usually mean the market is repricing (lineup news) or a line is stale/suspended — check the board split and verify it's still live. Alert bar: {EV_ALERT_MIN_PCT:g}%+")
         try:
             await channel.send(embed=embed)
-            _mark_alert_sent(today, r["market_key"], r["player"], r["point"], r["side"], r["book"])
-            log.info("EV alert posted: %s %s at %s (%.2f%%)", r["player"] or r["matchup"], _play_desc(r), r["book"], r["ev_pct"])
+            _mark_alert_sent(today, mk, player, point, side, "*")
+            log.info("EV alert posted: %s %s best @ %s (%.2f%%)", best["player"] or best["matchup"], _play_desc(best), best["book"], best["ev_pct"])
         except Exception as e:
             log.error("Failed to post EV alert: %s", e)
 
@@ -828,6 +861,7 @@ def register_commands(tree: app_commands.CommandTree):
         lines = [
             f"**{i+1}. {r['player'] or r['matchup']}** ({r['market_label']}) — {_play_desc(r)} @ {r['book']} "
             f"({r['price']:+d}) — EV **{r['ev_pct']:+.2f}%**"
+            + ("" if _consensus_reliable(r) else " ⚠️ *disputed line — books disagree on fair value*")
             for i, r in enumerate(rows[:5])
         ]
         embed = discord.Embed(title="🔝 Top 5 EV Plays Right Now", description="\n".join(lines), color=discord.Color.purple())
@@ -855,6 +889,7 @@ def register_commands(tree: app_commands.CommandTree):
             return
         lines = [
             f"**{r['market_label']}**: {_play_desc(r)} @ {r['book']} ({r['price']:+d}) — EV **{r['ev_pct']:+.2f}%**"
+            + ("" if _consensus_reliable(r) else " ⚠️ *disputed*")
             for r in matches[:10]
         ]
         embed = discord.Embed(title=f"{matches[0]['player']} — Current Prop EV", description="\n".join(lines), color=discord.Color.blue())
