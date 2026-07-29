@@ -250,6 +250,25 @@ def grade_pending(today: str | None = None) -> int:
 
 # ---------- reporting ----------
 
+def todays_leg_sets(category: str) -> list[frozenset]:
+    """Leg-name sets of every parlay already posted today in this category.
+    The no-repeat rule: the bot never re-sends a combination it already
+    posted today -- new request, new combination."""
+    try:
+        with _conn() as c:
+            rows = c.execute(
+                "SELECT p.id, l.name FROM parlays p JOIN parlay_legs l "
+                "ON l.parlay_id = p.id WHERE p.date_et = ? AND p.category = ?",
+                (et_date(), category)).fetchall()
+        by_pid: dict = {}
+        for pid, name in rows:
+            by_pid.setdefault(pid, set()).add(str(name))
+        return [frozenset(s) for s in by_pid.values()]
+    except Exception as e:
+        log.warning("parlay_track: todays_leg_sets failed: %s", e)
+        return []
+
+
 def summary(days: int = 1, category: str | None = None) -> dict:
     """Per-category W-L and units over the window (graded parlays only)."""
     cutoff = et_date(-days)
@@ -383,8 +402,17 @@ def start_tasks(client: discord.Client):
                     continue
                 ch = client.get_channel(cid)
                 if ch:
-                    await ch.send(embed=_recap_embed(s, "yesterday"))
-                    log.info("parlay_track: recap posted")
+                    # One recap PER CATEGORY (Mike's call): homers, hits,
+                    # Ks, ... each get their own embed -- only categories
+                    # with graded parlays yesterday post.
+                    for cat in CATEGORIES:
+                        if cat not in s["by_category"]:
+                            continue
+                        sc = await asyncio.to_thread(summary, 1, cat)
+                        await ch.send(embed=_recap_embed(
+                            sc, f"yesterday — {CATEGORIES[cat]}"))
+                    log.info("parlay_track: per-category recaps posted (%d)",
+                             len(s["by_category"]))
             except Exception as e:
                 log.error("parlay_track: recap loop error: %s", e)
 
