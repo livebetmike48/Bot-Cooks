@@ -2,6 +2,7 @@ import os
 import logging
 import asyncio
 from typing import Literal
+from datetime import datetime, timedelta, timezone
 
 LegsT = Literal[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
 
@@ -14,6 +15,13 @@ import statcast_api
 import odds_api
 import ev_features
 import parlay_track
+
+# Daily auto-parlays (one per category, staggered) -- set the channel to arm:
+AUTOPOST_CHANNEL_ID = int(os.getenv("PARLAY_AUTOPOST_CHANNEL_ID", "0") or 0)
+AUTOPOST_START_UTC = os.getenv("PARLAY_AUTOPOST_START_UTC", "15:00")  # 11am ET
+AUTOPOST_GAP_MIN = max(5, int(os.getenv("PARLAY_AUTOPOST_GAP_MIN", "15") or 15))
+AUTOPOST_CATEGORIES = os.getenv("PARLAY_AUTOPOST_CATEGORIES",
+                                "hr,hit,k,moneyline,totals")
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -184,25 +192,78 @@ def diversify(evaluated: list, want: int) -> list:
     return picked + rest
 
 
+def _leg_key(leg, game_of) -> str:
+    return str(leg.get("batter") or leg.get("starter") or leg.get("name")
+               or leg.get("team") or f"g{game_of.get(id(leg))}")
+
+
+def _fresh_pick(category: str, pool: list, game_of, want: int, **kw) -> list:
+    """pick_legs, but never the same combination twice in one day (Mike's
+    no-repeat rule: the bot has the stats -- new request, new parlay).
+    Retries the weighted shuffle until the combo is one we haven't posted
+    today; if the pool is too thin to vary, posts the best anyway rather
+    than nothing, and says so in the log."""
+    used = parlay_track.todays_leg_sets(category)
+    chosen = []
+    for attempt in range(10):
+        chosen = parlay.pick_legs(diversify(pool, want), game_of, want, **kw)
+        if not chosen:
+            return chosen
+        names = frozenset(_leg_key(l, game_of) for l in chosen)
+        if all(names != u and not names <= u for u in used):
+            if attempt:
+                log.info("parlay %s: fresh combo found on attempt %d", category, attempt + 1)
+            return chosen
+    log.warning("parlay %s: pool too thin to avoid a repeat today -- "
+                "posting best available", category)
+    return chosen
+
+
 def _track(category: str, chosen: list, priced_legs: list, header: str,
            kind_of, interaction, game_of=None):
     """Record the posted parlay at 1U. Best-effort: never breaks a command."""
     try:
         by_book = odds_api.parlay_by_book(priced_legs)
-        if not by_book:
-            return
-        book = max(by_book, key=lambda bk: by_book[bk]["combined"])
-        price = by_book[book]["combined"]
+        if by_book:
+            book = max(by_book, key=lambda bk: by_book[bk]["combined"])
+            price = by_book[book]["combined"]
+        else:
+            # No single book covers every leg (common outside HR) -- this
+            # used to silently skip recording, which is why the season
+            # record showed only HR parlays. Fall back to what the bot
+            # actually displays in that case: each leg's BEST price,
+            # combined. book="mixed" marks it honestly.
+            book, dec = "mixed", 1.0
+            for priced in priced_legs:
+                prices = (priced or {}).get("prices") or {}
+                if not prices:
+                    log.warning("parlay tracking: %s parlay NOT recorded -- "
+                                "a leg has no live price at any book", category)
+                    return
+                dec *= max(odds_api.american_to_decimal(p) for p in prices.values())
+            price = int(round((dec - 1) * 100)) if dec >= 2 else -int(round(100 / (dec - 1)))
         legs = []
-        for leg, priced in zip(chosen, priced_legs):
+        for i, (leg, priced) in enumerate(zip(chosen, priced_legs)):
             spec = kind_of(leg, priced)
             if not spec:
+                # NEVER silent: name the category and leg so a broken spec
+                # builder is visible in logs instead of erasing the parlay.
+                log.warning("parlay tracking: %s parlay NOT recorded -- "
+                            "spec builder returned None for leg %d", category, i + 1)
                 return
-            spec.setdefault("price", (priced or {}).get("prices", {}).get(book))
+            best_at = (priced or {}).get("prices", {}).get(book)
+            if best_at is None and book == "mixed":
+                prices = (priced or {}).get("prices") or {}
+                best_at = max(prices.values(),
+                              key=lambda p: odds_api.american_to_decimal(p)) if prices else None
+            spec.setdefault("price", best_at)
             spec.setdefault("book", book)
             legs.append(spec)
-        parlay_track.record(category, legs, price, book,
-                            requested_by=str(getattr(interaction.user, "id", "")))
+        pid = parlay_track.record(category, legs, price, book,
+                                  requested_by=str(getattr(interaction.user, "id", "")))
+        if pid is None:
+            log.warning("parlay tracking: %s parlay rejected by recorder "
+                        "(see parlay_track log line above)", category)
     except Exception as e:
         log.warning("parlay tracking skipped: %s", e)
 
@@ -400,7 +461,8 @@ class ParlayBot(discord.Client):
                 "(books pull props once games go live; lines post closer to game time).")
             return
 
-        chosen = parlay.pick_legs(diversify(evaluated, legs), game_of, legs)
+        chosen = _fresh_pick("hr" if market == "hr" else "hit",
+                             evaluated, game_of, legs)
 
         # Every chosen leg already carries its live price from the gate above
         priced_legs = [leg.get("_priced") for leg in chosen]
@@ -487,7 +549,7 @@ class ParlayBot(discord.Client):
                 "Starters found, but none have a live strikeouts prop right now "
                 "(K props post closer to game time).")
             return
-        chosen = parlay.pick_legs(diversify(gated, legs), game_of, legs)
+        chosen = _fresh_pick("k", gated, game_of, legs)
         priced_legs, k_lines = [], {}
         for leg in chosen:
             priced = leg.get("_priced")
@@ -570,7 +632,7 @@ class ParlayBot(discord.Client):
                 "Streak hitters found, but none have a live hits prop right now "
                 "(props post closer to game time).")
             return
-        chosen = parlay.pick_legs(diversify(gated, legs), game_of, legs)
+        chosen = _fresh_pick("streak", gated, game_of, legs)
         priced_legs = [leg.get("_priced") for leg in chosen]
         same_game = len({game_of.get(id(l)) for l in chosen}) < len(chosen)
         header, bet_buttons = parlay_ticket(priced_legs, same_game,
@@ -736,7 +798,7 @@ class ParlayBot(discord.Client):
             else:
                 await interaction.followup.send("No moneyline legs have live prices right now.")
             return
-        chosen = parlay.pick_legs(diversify(evaluated, legs), game_of, legs, max_per_game=1)
+        chosen = _fresh_pick("moneyline", evaluated, game_of, legs, max_per_game=1)
 
         priced_legs = []
         for leg in chosen:
@@ -857,6 +919,77 @@ class ParlayBot(discord.Client):
         log.info("Logged in as %s", self.user)
         ev_features.start_tasks(self)
         parlay_track.start_tasks(self)
+        if AUTOPOST_CHANNEL_ID:
+            self.loop.create_task(_autopost_task(self))
+        else:
+            log.info("PARLAY_AUTOPOST_CHANNEL_ID not set — daily auto-parlays off")
+
+
+class _AutoInteraction:
+    """Interaction stand-in for scheduled posts: the same command code
+    runs unchanged, its output lands in the auto-post channel. defer() is
+    a no-op, followup.send -> channel.send, user is None (recorded as an
+    unrequested post)."""
+    class _Resp:
+        async def defer(self, *a, **k):
+            return None
+    class _Follow:
+        def __init__(self, channel):
+            self._ch = channel
+        async def send(self, content=None, **kw):
+            kw.pop("ephemeral", None)
+            return await self._ch.send(content, **kw)
+    def __init__(self, channel):
+        self.channel = channel
+        self.response = self._Resp()
+        self.followup = self._Follow(channel)
+        self.user = None
+        self.guild = getattr(channel, "guild", None)
+        self.channel_id = getattr(channel, "id", None)
+
+
+async def _autopost_task(bot: "ParlayBot"):
+    """Every day, post one parlay per category on a stagger (11:00,
+    11:15, 11:30 ET, ...) even if nobody tags the bot -- the record
+    builds a sample size on its own. Uses the SAME command paths as
+    requests, so tracking, pricing, dedupe, and buttons all apply."""
+    try:
+        hh, mm = (int(x) for x in AUTOPOST_START_UTC.split(":"))
+    except Exception:
+        hh, mm = 15, 0
+    cats = [c.strip() for c in AUTOPOST_CATEGORIES.split(",") if c.strip()]
+    log.info("autopost task up — %02d:%02d UTC, %d categories, %dmin gaps",
+             hh, mm, len(cats), AUTOPOST_GAP_MIN)
+    runners = {
+        "hr": lambda ai: bot._batter_parlay(ai, "hr", 3),
+        "hit": lambda ai: bot._batter_parlay(ai, "hit", 3),
+        "k": lambda ai: bot._strikeouts_callback(ai, 3),
+        "streak": lambda ai: bot._streak_callback(ai),
+        "moneyline": lambda ai: bot._moneyline_callback(ai, 3),
+        "totals": lambda ai: bot._totals_callback(ai),
+    }
+    while True:
+        now = datetime.now(timezone.utc)
+        nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+        await asyncio.sleep((nxt - now).total_seconds())
+        ch = bot.get_channel(AUTOPOST_CHANNEL_ID)
+        if not ch:
+            log.warning("autopost channel %d not found", AUTOPOST_CHANNEL_ID)
+            continue
+        for i, cat in enumerate(cats):
+            if i:
+                await asyncio.sleep(AUTOPOST_GAP_MIN * 60)
+            run = runners.get(cat)
+            if not run:
+                log.warning("autopost: unknown category %r — skipping", cat)
+                continue
+            try:
+                await run(_AutoInteraction(ch))
+                log.info("autopost: %s parlay posted", cat)
+            except Exception as e:
+                log.error("autopost: %s failed (continuing): %s", cat, e)
 
 
 client = ParlayBot()
