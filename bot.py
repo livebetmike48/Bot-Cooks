@@ -16,6 +16,49 @@ import odds_api
 import ev_features
 import parlay_track
 
+BETTABLE = ("fanduel", "draftkings", "caesars", "betmgm")
+
+
+def _price_ladder_search(starter: str):
+    """Find the starter's K prices across every book by walking today's
+    events. odds_api caches event props 5 min, so repeats are free; the
+    first call costs ~1 credit per game searched."""
+    events = odds_api.get_events()
+    for ev in events or []:
+        props = odds_api.get_event_props(ev.get("id"), "pitcher_strikeouts")
+        if not props:
+            continue
+        over = odds_api.player_prop_prices(props, "pitcher_strikeouts", starter, side="over")
+        if not over or over.get("point") is None:
+            continue
+        under = odds_api.player_prop_prices(props, "pitcher_strikeouts", starter, side="under")
+        if under and under.get("point") != over.get("point"):
+            under = None
+        return {"game": f"{ev.get('away_team')} @ {ev.get('home_team')}",
+                "over": over, "under": under}
+    return None
+
+
+def _price_shop_embed(starter: str, found: dict) -> "discord.Embed":
+    emb = discord.Embed(title=f"💰 {starter} — K line shop", color=0x2F6FED)
+    emb.description = found.get("game") or ""
+    for label, side in (("O", "over"), ("U", "under")):
+        priced = found.get(side)
+        if not priced:
+            continue
+        prices = priced.get("prices") or {}
+        best = odds_api.best_price(prices)
+        lines = []
+        for book, price in sorted(prices.items(), key=lambda x: -x[1])[:12]:
+            mark = " ← best" if best and book == best[0] else ""
+            dot = "" if book.strip().lower() in BETTABLE else " ·"
+            lines.append(f"{book} **{price:+d}**{mark}{dot}")
+        emb.add_field(name=f"{label} {priced['point']} ({len(prices)} books)",
+                      value=chr(10).join(lines), inline=True)
+    emb.set_footer(text="· = not one of the four tracked books. Prices ≤5 min old.")
+    return emb
+
+
 # Daily auto-parlays (one per category, staggered) -- set the channel to arm:
 AUTOPOST_CHANNEL_ID = int(os.getenv("PARLAY_AUTOPOST_CHANNEL_ID", "0") or 0)
 AUTOPOST_START_UTC = os.getenv("PARLAY_AUTOPOST_START_UTC", "15:00")  # 11am ET
@@ -295,6 +338,13 @@ class ParlayBot(discord.Client):
                 callback=self._make_batter_callback(market),
             )
             self.tree.add_command(cmd)
+
+        price_cmd = app_commands.Command(
+            name="price",
+            description="Shop a starter's strikeout line across every book",
+            callback=self._price_callback,
+        )
+        self.tree.add_command(price_cmd)
 
         streak_cmd = app_commands.Command(
             name="streakparlay",
@@ -586,6 +636,23 @@ class ParlayBot(discord.Client):
             await interaction.followup.send(embed=embed, view=view)
         else:
             await interaction.followup.send(embed=embed)
+
+    async def _price_callback(self, interaction: discord.Interaction, starter: str):
+        """Line-shop one starter's K prices across every book, best marked,
+        the four bettable books clean and everything else dotted."""
+        await interaction.response.defer()
+        try:
+            found = await asyncio.to_thread(_price_ladder_search, starter)
+        except Exception as e:
+            log.warning("/price failed: %s", e)
+            await interaction.followup.send("Price lookup failed — try again in a minute.")
+            return
+        if not found:
+            await interaction.followup.send(
+                f"No strikeout line found for **{starter}** today — check the "
+                "spelling or lines may not be posted yet.")
+            return
+        await interaction.followup.send(embed=_price_shop_embed(starter, found))
 
     async def _streak_callback(self, interaction: discord.Interaction,
                                 min_streak: Literal[3, 4, 5, 6, 7, 8, 10] = 5,
