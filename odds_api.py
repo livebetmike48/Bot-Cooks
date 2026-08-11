@@ -338,6 +338,10 @@ def parlay_by_book(priced_legs: list[dict]) -> dict:
     books = set(priced_legs[0]["prices"])
     for p in priced_legs[1:]:
         books &= set(p["prices"])
+    # Parlays price ONLY at the four books Mike actually bets -- no
+    # BetOnline/LowVig-style offshore combined prices or links, ever.
+    PARLAY_BOOKS = ("fanduel", "draftkings", "caesars", "betmgm")
+    books = {b for b in books if b.strip().lower() in PARLAY_BOOKS}
     out = {}
     for book in books:
         dec = 1.0
