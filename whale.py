@@ -77,6 +77,63 @@ def _bucket_of(title: str) -> str:
     return "prop" if any(h in t for h in PROP_HINTS) else "game"
 
 
+KALSHI_MARKET_URL = "https://external-api.kalshi.com/trade-api/v2/markets/{}"
+_kalshi_titles: dict = {}
+_KALSHI_SERIES = {"RFI": "Run in the 1st inning", "GAME": "Game winner",
+                  "TOTAL": "Total", "SPREAD": "Spread",
+                  "PASSYDS": "Passing yards", "RUSHYDS": "Rushing yards",
+                  "RECYDS": "Receiving yards", "PTS": "Points",
+                  "SERIES": "Series winner", "HR": "Home run"}
+
+
+def _decode_kalshi_ticker(ticker: str) -> str:
+    """Best-effort human label straight from the ticker, for when the
+    title lookup fails: KXMLBRFI-26AUG111845CHCWSH ->
+    'MLB CHC/WSH — Run in the 1st inning'."""
+    try:
+        head = ticker.split("-", 1)[0].upper()
+        if head.startswith("KX"):
+            head = head[2:]
+        league = next((lg.upper() for lg in LEAGUES if head.startswith(lg.upper())), "")
+        series = head[len(league):]
+        series_name = _KALSHI_SERIES.get(series, series.title())
+        tail = ticker.split("-")[-1]
+        alpha = "".join(ch for ch in tail if ch.isalpha())
+        # team codes are the LAST six letters (the date contributes "AUG")
+        teams = f"{alpha[-6:-3]}/{alpha[-3:]}" if len(alpha) >= 6 else alpha
+        parts = [p for p in (league, teams) if p]
+        return f"{' '.join(parts)} — {series_name}" if parts else series_name
+    except Exception:
+        return ticker
+
+
+def kalshi_title(ticker: str) -> str:
+    """The market's REAL question ('Will a run be scored in the 1st
+    inning...?') from Kalshi's public market endpoint, cached per ticker
+    for the process lifetime; decoder fallback so display never breaks."""
+    if ticker in _kalshi_titles:
+        return _kalshi_titles[ticker]
+    title = None
+    try:
+        r = requests.get(KALSHI_MARKET_URL.format(ticker), timeout=10)
+        if r.status_code == 200:
+            m = (r.json() or {}).get("market") or {}
+            title = m.get("title") or None
+            sub = m.get("yes_sub_title") or ""
+            if title and sub and sub.lower() not in title.lower():
+                title = f"{title} ({sub})"
+    except Exception as e:
+        log.warning("kalshi title lookup failed for %s: %s", ticker, e)
+    if not title:
+        title = _decode_kalshi_ticker(ticker)
+    _kalshi_titles[ticker] = title
+    return title
+
+
+def display_title(source: str, title: str) -> str:
+    return kalshi_title(title) if (source or "").lower() == "kalshi" else title
+
+
 def _fmt_usd(x: float) -> str:
     return f"${x:,.0f}"
 
@@ -264,7 +321,10 @@ def alert_embed(a: dict) -> discord.Embed:
         title=(f"🐋 {_fmt_usd(a['notional'])} accumulated on {a['source']}"
                if a.get("accum") else
                f"🐋 {_fmt_usd(a['notional'])} on {a['source']}"),
-        description=f"**{a['title']}**", color=0x1B7F4D)
+        description=(f"**{display_title(a['source'], a['title'])}**"
+                     + (f"\n`{a['title']}`"
+                        if (a['source'] or '').lower() == 'kalshi' else "")),
+        color=0x1B7F4D)
     bits = []
     if a.get("side"):
         bits.append(a["side"].title())
@@ -370,7 +430,8 @@ async def whale_callback(interaction: discord.Interaction):
     lines = []
     for i, r in enumerate(rows, 1):
         who = f" `{r['wallet'][:6]}…`" if r.get("wallet") else ""
-        lines.append(f"**{i}. {_fmt_usd(r['notional'])}** — {r['title']} "
+        lines.append(f"**{i}. {_fmt_usd(r['notional'])}** — "
+                     f"{display_title(r['source'], r['title'])} "
                      f"({r['source']}, {r['league'].upper()} {r['bucket']}, "
                      f"@{r['price']:.2f}){who}")
     emb.description = "\n".join(lines)
