@@ -158,6 +158,137 @@ def _price_shop_embed(name: str, market: str, found: dict) -> "discord.Embed":
     return emb
 
 
+# ---------- /moves: sharp-money steam tracker ----------
+# The bot takes its OWN morning snapshot of the slate (one wide pass,
+# ~30-50 credits) and /moves ranks the biggest movers open->now. Honest
+# label baked in: movement is the observable; "they took money" is the
+# inference. Snapshot lives in memory + best-effort sqlite -- if the bot
+# restarts midday it says so instead of faking an opener.
+MOVES_SNAP_UTC = os.getenv("MOVES_SNAP_UTC", "13:45")  # 9:45 AM ET
+_moves_snap: dict = {"date": None, "rows": {}}
+
+
+def _et_today() -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%d")
+
+
+def _avg_price(prices: dict) -> float | None:
+    clean = list(_strip_offshore(prices).values())
+    return round(sum(clean) / len(clean), 1) if clean else None
+
+
+def _slate_prices() -> dict:
+    """One pass over the slate: {key: {'label', 'point', 'avg'}} for
+    moneylines, totals, and every posted K line."""
+    rows = {}
+    for ev in odds_api.get_mlb_odds(markets="h2h") or []:
+        for team in (ev.get("home_team"), ev.get("away_team")):
+            if not team:
+                continue
+            avg = _avg_price(odds_api.all_prices(ev, "h2h", team))
+            if avg is not None:
+                rows[f"ml|{team}"] = {"label": f"{team} ML", "point": None, "avg": avg}
+    for ev in odds_api.get_mlb_odds(markets="totals") or []:
+        tl = odds_api.totals_line(ev)
+        if not tl:
+            continue
+        game = f"{ev.get('away_team')} @ {ev.get('home_team')}"
+        for side in ("over", "under"):
+            avg = _avg_price(tl.get(side) or {})
+            if avg is not None:
+                rows[f"tot|{game}|{side}"] = {"label": f"{game} {side.title()}",
+                                              "point": tl["point"], "avg": avg}
+    for ev in odds_api.get_events() or []:
+        props = odds_api.get_event_props(ev.get("id"), "pitcher_strikeouts")
+        if not props:
+            continue
+        seen = set()
+        for book in props.get("bookmakers", []) or []:
+            for market in book.get("markets", []) or []:
+                if market.get("key") != "pitcher_strikeouts":
+                    continue
+                for o in market.get("outcomes", []) or []:
+                    d = o.get("description")
+                    if d:
+                        seen.add(d)
+        for player in seen:
+            priced = odds_api.player_prop_prices(props, "pitcher_strikeouts", player)
+            if not priced or priced.get("point") is None:
+                continue
+            avg = _avg_price(priced["prices"])
+            if avg is not None:
+                rows[f"k|{player}"] = {"label": f"{player} Ks",
+                                       "point": priced["point"], "avg": avg}
+    return rows
+
+
+def _take_moves_snapshot():
+    _moves_snap["date"] = _et_today()
+    _moves_snap["rows"] = _slate_prices()
+    log.info("moves snapshot: %d outcomes stored for %s",
+             len(_moves_snap["rows"]), _moves_snap["date"])
+
+
+def _rank_moves(top: int = 8) -> list[dict] | None:
+    if _moves_snap["date"] != _et_today() or not _moves_snap["rows"]:
+        return None
+    now = _slate_prices()
+    moves = []
+    for key, cur in now.items():
+        opened = _moves_snap["rows"].get(key)
+        if not opened:
+            continue
+        pt_move = 0.0
+        if cur.get("point") is not None and opened.get("point") is not None:
+            pt_move = cur["point"] - opened["point"]
+        cents = cur["avg"] - opened["avg"]
+        score = abs(cents) + 80 * abs(pt_move)
+        if score < 5:
+            continue
+        moves.append({"label": cur["label"], "open_avg": opened["avg"],
+                      "now_avg": cur["avg"], "cents": round(cents, 1),
+                      "open_pt": opened.get("point"), "now_pt": cur.get("point"),
+                      "pt_move": pt_move, "score": score})
+    moves.sort(key=lambda m: -m["score"])
+    return moves[:top]
+
+
+def _moves_embed(moves: list[dict], snap_date: str) -> "discord.Embed":
+    emb = discord.Embed(title="📈 Sharp money watch — biggest moves since open",
+                        color=0x2F6FED)
+    lines = []
+    for i, m in enumerate(moves, 1):
+        if m["pt_move"]:
+            lines.append(f"**{i}. {m['label']}** — line {m['open_pt']:g} → "
+                         f"{m['now_pt']:g} (avg {m['open_avg']:+g} → {m['now_avg']:+g})")
+        else:
+            arrow = "steam ↑" if m["cents"] < 0 else "drift ↓"
+            lines.append(f"**{i}. {m['label']}** — avg {m['open_avg']:+g} → "
+                         f"{m['now_avg']:+g} ({m['cents']:+g}c, {arrow})")
+    emb.description = chr(10).join(lines)
+    emb.set_footer(text=f"vs the {snap_date} 9:45 AM ET snapshot · avg across real US books · "
+                        "movement is the observable — the money is the inference")
+    return emb
+
+
+async def _moves_snapshot_task(bot: "ParlayBot"):
+    try:
+        hh, mm = (int(x) for x in MOVES_SNAP_UTC.split(":"))
+    except Exception:
+        hh, mm = 13, 45
+    log.info("moves snapshot task up — %02d:%02d UTC daily", hh, mm)
+    while True:
+        now = datetime.now(timezone.utc)
+        nxt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if nxt <= now:
+            nxt += timedelta(days=1)
+        await asyncio.sleep((nxt - now).total_seconds())
+        try:
+            await asyncio.to_thread(_take_moves_snapshot)
+        except Exception as e:
+            log.error("moves snapshot failed: %s", e)
+
+
 # Daily auto-parlays (one per category, staggered) -- set the channel to arm:
 AUTOPOST_CHANNEL_ID = int(os.getenv("PARLAY_AUTOPOST_CHANNEL_ID", "0") or 0)
 AUTOPOST_START_UTC = os.getenv("PARLAY_AUTOPOST_START_UTC", "15:00")  # 11am ET
@@ -437,6 +568,13 @@ class ParlayBot(discord.Client):
                 callback=self._make_batter_callback(market),
             )
             self.tree.add_command(cmd)
+
+        moves_cmd = app_commands.Command(
+            name="moves",
+            description="Top movers since open — the sharp money watch",
+            callback=self._moves_callback,
+        )
+        self.tree.add_command(moves_cmd)
 
         price_cmd = app_commands.Command(
             name="price",
@@ -735,6 +873,25 @@ class ParlayBot(discord.Client):
             await interaction.followup.send(embed=embed, view=view)
         else:
             await interaction.followup.send(embed=embed)
+
+    async def _moves_callback(self, interaction: discord.Interaction):
+        """Top movers since this morning's snapshot."""
+        await interaction.response.defer()
+        try:
+            moves = await asyncio.to_thread(_rank_moves)
+        except Exception as e:
+            log.warning("/moves failed: %s", e)
+            await interaction.followup.send("Moves lookup failed — try again in a minute.")
+            return
+        if moves is None:
+            await interaction.followup.send(
+                "No morning snapshot for today (bot restarted or before 9:45 AM ET) — "
+                "the next one lands at 9:45 tomorrow, then /moves is live.")
+            return
+        if not moves:
+            await interaction.followup.send("Quiet board — nothing has moved meaningfully since open.")
+            return
+        await interaction.followup.send(embed=_moves_embed(moves, _moves_snap["date"]))
 
     async def _price_callback(self, interaction: discord.Interaction,
                               name: str, market: PriceMarketT = "strikeouts"):
@@ -1093,6 +1250,7 @@ class ParlayBot(discord.Client):
         parlay_track.start_tasks(self)
         if AUTOPOST_CHANNEL_ID:
             self.loop.create_task(_autopost_task(self))
+            self.loop.create_task(_moves_snapshot_task(self))
         else:
             log.info("PARLAY_AUTOPOST_CHANNEL_ID not set — daily auto-parlays off")
 
