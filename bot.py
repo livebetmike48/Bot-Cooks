@@ -19,6 +19,29 @@ import parlay_track
 BETTABLE = ("fanduel", "draftkings", "caesars", "betmgm")
 
 
+def _extract_side(props: dict, player_name: str, side: str, point) -> dict | None:
+    """All books' prices for one side at one point, straight off the raw
+    payload -- this repo's player_prop_prices is over-only, so the under
+    is read here with the same name/point matching rules."""
+    target = (player_name or "").strip().lower()
+    target_last = target.split()[-1] if target else ""
+    prices = {}
+    for book in (props or {}).get("bookmakers", []) or []:
+        for market in book.get("markets", []) or []:
+            if market.get("key") != "pitcher_strikeouts":
+                continue
+            for outcome in market.get("outcomes", []) or []:
+                if (outcome.get("name") or "").lower() != side:
+                    continue
+                desc = (outcome.get("description") or "").lower()
+                if not desc or (target not in desc and target_last not in desc):
+                    continue
+                if outcome.get("point") != point:
+                    continue
+                prices[book.get("title", "?")] = outcome.get("price")
+    return {"point": point, "prices": prices} if prices else None
+
+
 def _price_ladder_search(starter: str):
     """Find the starter's K prices across every book by walking today's
     events. odds_api caches event props 5 min, so repeats are free; the
@@ -28,12 +51,10 @@ def _price_ladder_search(starter: str):
         props = odds_api.get_event_props(ev.get("id"), "pitcher_strikeouts")
         if not props:
             continue
-        over = odds_api.player_prop_prices(props, "pitcher_strikeouts", starter, side="over")
+        over = odds_api.player_prop_prices(props, "pitcher_strikeouts", starter)
         if not over or over.get("point") is None:
             continue
-        under = odds_api.player_prop_prices(props, "pitcher_strikeouts", starter, side="under")
-        if under and under.get("point") != over.get("point"):
-            under = None
+        under = _extract_side(props, starter, "under", over["point"])
         return {"game": f"{ev.get('away_team')} @ {ev.get('home_team')}",
                 "over": over, "under": under}
     return None
