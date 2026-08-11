@@ -39,6 +39,11 @@ KALSHI_TRADES = "https://external-api.kalshi.com/trade-api/v2/markets/trades"
 GAME_MIN = float(os.getenv("WHALE_GAME_MIN", "50000") or 50000)
 PROP_MIN = float(os.getenv("WHALE_PROP_MIN", "5000") or 5000)
 POLL_MIN = max(1, int(os.getenv("WHALE_POLL_MIN", "3") or 3))
+# Big orders FRAGMENT: a $50K wager sweeps the book as many smaller fills,
+# none of which trips the single-print bar (Mike proved it with his own
+# test bet). So alerts fire two ways: a single print over the bar, OR a
+# wallet/market ACCUMULATING past the bar inside this rolling window.
+ACCUM_WINDOW_MIN = max(5, int(os.getenv("WHALE_ACCUM_WINDOW_MIN", "60") or 60))
 CHANNEL_ID = int(os.getenv("WHALE_CHANNEL_ID", "0") or 0)
 DB = os.getenv("WHALE_DB", "whale.db")
 
@@ -54,6 +59,8 @@ def _conn():
         source TEXT, trade_id TEXT, wallet TEXT, title TEXT, side TEXT,
         outcome TEXT, notional REAL, price REAL, bucket TEXT, league TEXT,
         ts INTEGER, PRIMARY KEY (source, trade_id))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS whale_accum_alerts (
+        akey TEXT PRIMARY KEY, ts INTEGER)""")
     return c
 
 
@@ -80,16 +87,26 @@ def poll_polymarket(state: dict) -> list[dict]:
     """New league trades over threshold since the last poll. Every trade
     (big or not) from tracked leagues goes into the wallet ledger so the
     /sharp board sees full volume, not only alerts."""
+    trades = []
     try:
-        r = requests.get(PM_TRADES, params={"limit": 500, "takerOnly": "true"},
-                         timeout=20)
-        r.raise_for_status()
-        trades = r.json()
-        if isinstance(trades, dict):
-            trades = trades.get("trades") or trades.get("data") or []
+        for offset in (0, 500):
+            r = requests.get(PM_TRADES,
+                             params={"limit": 500, "offset": offset,
+                                     "takerOnly": "true"}, timeout=20)
+            r.raise_for_status()
+            page = r.json()
+            if isinstance(page, dict):
+                page = page.get("trades") or page.get("data") or []
+            if not page:
+                break
+            trades.extend(page)
+            oldest = min(int(t.get("timestamp") or 0) for t in page)
+            if oldest <= state.get("pm_last_ts", 0):
+                break
     except Exception as e:
         log.warning("polymarket poll failed: %s", e)
-        return []
+        if not trades:
+            return []
     alerts = []
     last_ts = state.get("pm_last_ts", 0)
     newest = last_ts
@@ -136,13 +153,29 @@ def poll_polymarket(state: dict) -> list[dict]:
 def poll_kalshi(state: dict) -> list[dict]:
     """Big prints on league markets. Anonymous by design -- no wallet is
     stored or implied; block trades flagged as such."""
+    trades = []
+    cursor = None
+    last_seen = state.get("kalshi_last", "")
     try:
-        r = requests.get(KALSHI_TRADES, params={"limit": 500}, timeout=20)
-        r.raise_for_status()
-        trades = (r.json() or {}).get("trades") or []
+        for _page in range(4):  # busy tape can exceed one page per poll
+            params = {"limit": 500}
+            if cursor:
+                params["cursor"] = cursor
+            r = requests.get(KALSHI_TRADES, params=params, timeout=20)
+            r.raise_for_status()
+            j = r.json() or {}
+            page = j.get("trades") or []
+            trades.extend(page)
+            cursor = j.get("cursor")
+            if not cursor or not page:
+                break
+            oldest = min((t.get("created_time") or "") for t in page)
+            if last_seen and oldest <= last_seen:
+                break  # walked back past what we've already seen
     except Exception as e:
         log.warning("kalshi poll failed: %s", e)
-        return []
+        if not trades:
+            return []
     alerts = []
     last = state.get("kalshi_last", "")
     newest = last
@@ -192,17 +225,55 @@ def poll_kalshi(state: dict) -> list[dict]:
     return alerts
 
 
+def accumulation_alerts() -> list[dict]:
+    """Wallets (Polymarket) or markets (Kalshi, anonymous) whose SUMMED
+    fills inside the rolling window crossed the bar without any single
+    print doing so. Alerted once per wallet+market per window-crossing
+    (dedupe table), so a whale laddering in fires exactly one alert."""
+    cutoff = int(time.time()) - ACCUM_WINDOW_MIN * 60
+    out = []
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT source, COALESCE(wallet, ''), title, bucket, league, "
+            "SUM(notional), COUNT(*), MAX(notional), MAX(ts) "
+            "FROM whale_trades WHERE ts >= ? "
+            "GROUP BY source, COALESCE(wallet, ''), title", (cutoff,)).fetchall()
+        for src_, wallet, title, bucket, league, total, n, biggest, last_ts in rows:
+            bar = GAME_MIN if bucket == "game" else PROP_MIN
+            if total < bar or biggest >= bar or n < 2:
+                continue  # single big print already alerts on its own
+            akey = f"{src_}|{wallet}|{title}|{int(cutoff / (ACCUM_WINDOW_MIN * 60))}"
+            akey = f"{src_}|{wallet}|{title}"
+            already = c.execute("SELECT ts FROM whale_accum_alerts WHERE akey=?",
+                                (akey,)).fetchone()
+            if already and already[0] >= cutoff:
+                continue
+            c.execute("INSERT OR REPLACE INTO whale_accum_alerts VALUES (?, ?)",
+                      (akey, last_ts))
+            out.append({"source": src_.title(), "title": title,
+                        "side": "", "outcome": f"{n} fills in {ACCUM_WINDOW_MIN}m",
+                        "notional": round(total, 2), "price": 0.0,
+                        "bucket": bucket, "league": league,
+                        "wallet": wallet or None, "accum": True, "ts": last_ts})
+    return out
+
+
 def alert_embed(a: dict) -> discord.Embed:
     thresh = "game" if a["bucket"] == "game" else "prop"
     emb = discord.Embed(
-        title=f"🐋 {_fmt_usd(a['notional'])} on {a['source']}",
+        title=(f"🐋 {_fmt_usd(a['notional'])} accumulated on {a['source']}"
+               if a.get("accum") else
+               f"🐋 {_fmt_usd(a['notional'])} on {a['source']}"),
         description=f"**{a['title']}**", color=0x1B7F4D)
     bits = []
     if a.get("side"):
         bits.append(a["side"].title())
     if a.get("outcome"):
         bits.append(a["outcome"])
-    bits.append(f"@ {a['price']:.2f}")
+    if a.get("accum"):
+        bits = [a.get("outcome") or "accumulated"]
+    else:
+        bits.append(f"@ {a['price']:.2f}")
     emb.add_field(name="Trade", value=" · ".join(bits), inline=True)
     emb.add_field(name="Bucket", value=f"{a['league'].upper()} {thresh}", inline=True)
     if a.get("wallet"):
@@ -218,10 +289,13 @@ def whale_today() -> list[dict]:
     cutoff = int(time.time()) - 24 * 3600
     with _conn() as c:
         rows = c.execute(
-            "SELECT source, title, side, notional, price, bucket, league, wallet "
-            "FROM whale_trades WHERE ts >= ? AND "
-            "((bucket='game' AND notional >= ?) OR (bucket='prop' AND notional >= ?)) "
-            "ORDER BY notional DESC LIMIT 10",
+            "SELECT source, title, MAX(side), SUM(notional), MAX(price), bucket, "
+            "league, COALESCE(wallet,'') "
+            "FROM whale_trades WHERE ts >= ? "
+            "GROUP BY source, COALESCE(wallet,''), title, bucket, league "
+            "HAVING (bucket='game' AND SUM(notional) >= ?) "
+            "    OR (bucket='prop' AND SUM(notional) >= ?) "
+            "ORDER BY SUM(notional) DESC LIMIT 10",
             (cutoff, GAME_MIN, PROP_MIN)).fetchall()
     return [{"source": s, "title": t, "side": sd, "notional": n, "price": p,
              "bucket": b, "league": lg, "wallet": w}
@@ -268,6 +342,10 @@ async def poll_task(bot):
                 alerts.extend(await asyncio.to_thread(fn, state))
             except Exception as e:
                 log.error("whale poll error: %s", e)
+        try:
+            alerts.extend(await asyncio.to_thread(accumulation_alerts))
+        except Exception as e:
+            log.error("whale accumulation error: %s", e)
         if not alerts or not CHANNEL_ID:
             continue
         ch = bot.get_channel(CHANNEL_ID)
