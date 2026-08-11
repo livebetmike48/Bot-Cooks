@@ -14,6 +14,7 @@ import parlay
 import statcast_api
 import odds_api
 import ev_features
+import whale
 import parlay_track
 
 BETTABLE = ("fanduel", "draftkings", "caesars", "betmgm")
@@ -558,6 +559,7 @@ class ParlayBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        whale.setup(self)
         for name, market, desc in [
             ("hitparlay", "hit", "Build a hits parlay from today's real matchup data"),
             ("hrparlay", "hr", "Build a home run parlay from today's real matchup data"),
@@ -1251,6 +1253,7 @@ class ParlayBot(discord.Client):
         if AUTOPOST_CHANNEL_ID:
             self.loop.create_task(_autopost_task(self))
             self.loop.create_task(_moves_snapshot_task(self))
+            self.loop.create_task(whale.poll_task(self))
         else:
             log.info("PARLAY_AUTOPOST_CHANNEL_ID not set — daily auto-parlays off")
 
