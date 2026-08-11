@@ -17,18 +17,39 @@ import ev_features
 import parlay_track
 
 BETTABLE = ("fanduel", "draftkings", "caesars", "betmgm")
+# Real US books stay listed (Fanatics, theScore, Bally...); offshore books
+# never render anywhere -- Mike: "i just dont want offshores".
+OFFSHORE = ("betonline", "lowvig", "bovada", "mybookie", "betus",
+            "everygame", "betanysports")
+
+PRICE_GAME_MARKETS = {"moneyline": "h2h", "total": "totals", "spread": "spreads"}
+PRICE_PROP_MARKETS = {
+    "strikeouts": "pitcher_strikeouts", "outs": "pitcher_outs",
+    "hits allowed": "pitcher_hits_allowed", "walks": "pitcher_walks",
+    "batter hits": "batter_hits", "batter hrs": "batter_home_runs",
+    "total bases": "batter_total_bases", "rbis": "batter_rbis",
+    "runs": "batter_runs_scored",
+}
+PriceMarketT = Literal["strikeouts", "outs", "hits allowed", "walks",
+                       "batter hits", "batter hrs", "total bases", "rbis",
+                       "runs", "moneyline", "total", "spread"]
 
 
-def _extract_side(props: dict, player_name: str, side: str, point) -> dict | None:
+def _strip_offshore(prices: dict) -> dict:
+    return {b: p for b, p in (prices or {}).items()
+            if p is not None and not any(o in b.strip().lower() for o in OFFSHORE)}
+
+
+def _extract_side(props: dict, player_name: str, side: str, point, market_key: str) -> dict | None:
     """All books' prices for one side at one point, straight off the raw
-    payload -- this repo's player_prop_prices is over-only, so the under
-    is read here with the same name/point matching rules."""
+    payload -- the repo's player_prop_prices is over-only, so unders are
+    read here with the same name/point matching rules."""
     target = (player_name or "").strip().lower()
     target_last = target.split()[-1] if target else ""
     prices = {}
     for book in (props or {}).get("bookmakers", []) or []:
         for market in book.get("markets", []) or []:
-            if market.get("key") != "pitcher_strikeouts":
+            if market.get("key") != market_key:
                 continue
             for outcome in market.get("outcomes", []) or []:
                 if (outcome.get("name") or "").lower() != side:
@@ -42,41 +63,98 @@ def _extract_side(props: dict, player_name: str, side: str, point) -> dict | Non
     return {"point": point, "prices": prices} if prices else None
 
 
-def _price_ladder_search(starter: str):
-    """Find the starter's K prices across every book by walking today's
-    events. odds_api caches event props 5 min, so repeats are free; the
-    first call costs ~1 credit per game searched."""
-    events = odds_api.get_events()
-    for ev in events or []:
-        props = odds_api.get_event_props(ev.get("id"), "pitcher_strikeouts")
+def _prop_ladder_search(name: str, market_key: str):
+    """Walk today's events for one player's prop across every book.
+    Cached 5 min per event+market, so repeats are free."""
+    for ev in odds_api.get_events() or []:
+        props = odds_api.get_event_props(ev.get("id"), market_key)
         if not props:
             continue
-        over = odds_api.player_prop_prices(props, "pitcher_strikeouts", starter)
+        over = odds_api.player_prop_prices(props, market_key, name)
         if not over or over.get("point") is None:
             continue
-        under = _extract_side(props, starter, "under", over["point"])
-        return {"game": f"{ev.get('away_team')} @ {ev.get('home_team')}",
-                "over": over, "under": under}
+        under = _extract_side(props, name, "under", over["point"], market_key)
+        sides = {"O %s" % over["point"]: over}
+        if under:
+            sides["U %s" % under["point"]] = under
+        return {"game": "%s @ %s" % (ev.get("away_team"), ev.get("home_team")),
+                "sides": sides}
     return None
 
 
-def _price_shop_embed(starter: str, found: dict) -> "discord.Embed":
-    emb = discord.Embed(title=f"💰 {starter} — K line shop", color=0x2F6FED)
-    emb.description = found.get("game") or ""
-    for label, side in (("O", "over"), ("U", "under")):
-        priced = found.get(side)
-        if not priced:
+def _spread_line(ev: dict, team_folded: str):
+    """The queried team's spread at its most-quoted point across books."""
+    points = {}
+    for book in ev.get("bookmakers", []) or []:
+        for market in book.get("markets", []) or []:
+            if market.get("key") != "spreads":
+                continue
+            for outcome in market.get("outcomes", []) or []:
+                nm = (outcome.get("name") or "").lower()
+                if team_folded not in nm and nm not in team_folded:
+                    continue
+                pt = outcome.get("point")
+                if pt is None:
+                    continue
+                points.setdefault(pt, {})[book.get("title", "?")] = outcome.get("price")
+    if not points:
+        return None
+    pt = max(points, key=lambda p: len(points[p]))
+    return {"point": pt, "prices": points[pt]}
+
+
+def _game_ladder_search(team: str, label: str):
+    """Moneyline / total / spread for a team's game today."""
+    gkey = PRICE_GAME_MARKETS[label]
+    want = team.strip().lower()
+    for ev in odds_api.get_mlb_odds(markets=gkey) or []:
+        home = (ev.get("home_team") or "").lower()
+        away = (ev.get("away_team") or "").lower()
+        if want not in home and want not in away:
             continue
-        prices = priced.get("prices") or {}
+        matched = ev.get("home_team") if want in home else ev.get("away_team")
+        game = "%s @ %s" % (ev.get("away_team"), ev.get("home_team"))
+        if label == "moneyline":
+            prices = odds_api.all_prices(ev, "h2h", matched)
+            if not prices:
+                return None
+            return {"game": game,
+                    "sides": {"ML — %s" % matched: {"point": None, "prices": prices}}}
+        if label == "total":
+            tl = odds_api.totals_line(ev)
+            if not tl:
+                return None
+            return {"game": game, "sides": {
+                "O %s" % tl["point"]: {"point": tl["point"], "prices": tl.get("over") or {}},
+                "U %s" % tl["point"]: {"point": tl["point"], "prices": tl.get("under") or {}}}}
+        sp = _spread_line(ev, (matched or "").lower())
+        if not sp:
+            return None
+        return {"game": game,
+                "sides": {"%s %+g" % (matched, sp["point"]): sp}}
+    return None
+
+
+def _price_shop_embed(name: str, market: str, found: dict) -> "discord.Embed":
+    emb = discord.Embed(title="💰 %s — %s shop" % (name, market), color=0x2F6FED)
+    emb.description = found.get("game") or ""
+    shown = 0
+    for label, priced in found.get("sides", {}).items():
+        prices = _strip_offshore((priced or {}).get("prices"))
+        if not prices:
+            continue
         best = odds_api.best_price(prices)
         lines = []
         for book, price in sorted(prices.items(), key=lambda x: -x[1])[:12]:
             mark = " ← best" if best and book == best[0] else ""
             dot = "" if book.strip().lower() in BETTABLE else " ·"
-            lines.append(f"{book} **{price:+d}**{mark}{dot}")
-        emb.add_field(name=f"{label} {priced['point']} ({len(prices)} books)",
+            lines.append("%s **%+d**%s%s" % (book, price, mark, dot))
+        emb.add_field(name="%s (%d books)" % (label, len(prices)),
                       value=chr(10).join(lines), inline=True)
-    emb.set_footer(text="· = not one of the four tracked books. Prices ≤5 min old.")
+        shown += 1
+    if not shown:
+        emb.description = (emb.description or "") + chr(10) + "no non-offshore prices found"
+    emb.set_footer(text="· = not one of the four parlay books (real US books only; offshores never shown)")
     return emb
 
 
@@ -362,7 +440,7 @@ class ParlayBot(discord.Client):
 
         price_cmd = app_commands.Command(
             name="price",
-            description="Shop a starter's strikeout line across every book",
+            description="Shop any MLB market across every book — props, ML, totals, spreads",
             callback=self._price_callback,
         )
         self.tree.add_command(price_cmd)
@@ -658,22 +736,28 @@ class ParlayBot(discord.Client):
         else:
             await interaction.followup.send(embed=embed)
 
-    async def _price_callback(self, interaction: discord.Interaction, starter: str):
-        """Line-shop one starter's K prices across every book, best marked,
-        the four bettable books clean and everything else dotted."""
+    async def _price_callback(self, interaction: discord.Interaction,
+                              name: str, market: PriceMarketT = "strikeouts"):
+        """Shop any MLB market across every book: game markets take a team
+        name, props take a player name."""
         await interaction.response.defer()
         try:
-            found = await asyncio.to_thread(_price_ladder_search, starter)
+            if market in PRICE_GAME_MARKETS:
+                found = await asyncio.to_thread(_game_ladder_search, name, market)
+            else:
+                found = await asyncio.to_thread(
+                    _prop_ladder_search, name, PRICE_PROP_MARKETS[market])
         except Exception as e:
             log.warning("/price failed: %s", e)
             await interaction.followup.send("Price lookup failed — try again in a minute.")
             return
         if not found:
+            kind = "team" if market in PRICE_GAME_MARKETS else "player"
             await interaction.followup.send(
-                f"No strikeout line found for **{starter}** today — check the "
-                "spelling or lines may not be posted yet.")
+                "No %s line found for **%s** today — check the %s name or "
+                "lines may not be posted yet." % (market, name, kind))
             return
-        await interaction.followup.send(embed=_price_shop_embed(starter, found))
+        await interaction.followup.send(embed=_price_shop_embed(name, market, found))
 
     async def _streak_callback(self, interaction: discord.Interaction,
                                 min_streak: Literal[3, 4, 5, 6, 7, 8, 10] = 5,
