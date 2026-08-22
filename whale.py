@@ -11,16 +11,26 @@ next to sportsbook steam:
     regulated exchange, anonymous tape -> big prints only, labeled as
     flow, never as named whales.
 
-Thresholds (env-tunable):
-  WHALE_GAME_MIN   default 50000  -- moneyline/total/game markets ($)
-  WHALE_PROP_MIN   default 5000   -- player-prop-style markets ($)
-  WHALE_POLL_MIN   default 3      -- poll cadence, minutes
-  WHALE_CHANNEL_ID -- channel for alerts (unset = commands only)
-Leagues: MLB, NFL, NBA, NHL. Classification is by title/ticker text --
-game-winner style markets get the big threshold, everything else in a
-league gets the prop threshold; the embed shows which bucket fired.
+ALERT POLICY (Mike, Aug 21): notifications fire ONLY on moneyline and
+total markets, ONLY at WHALE_GAME_MIN (default $250,000), and ONLY in
+real time -- a single print over the bar, or one actor's fills summing
+past it inside a short burst window (WHALE_BURST_WINDOW_MIN, default 10;
+0 = single prints only). The old rolling-hour market-wide accumulation
+is GONE -- crowd volume re-crossing a bar all day was the spam. One
+alert per market/side per day, period. Props and spreads still flow
+into the ledger for /whale and /sharp; they never notify.
+
+Env:
+  WHALE_GAME_MIN         default 250000 -- moneyline/total alert bar ($)
+  WHALE_BURST_WINDOW_MIN default 10     -- same-actor burst window (0=off)
+  WHALE_POLL_MIN         default 3      -- poll cadence, minutes
+  WHALE_CHANNEL_ID       -- channel for alerts (unset = commands only)
+  WHALE_PROP_MIN         -- ledger bucket label only; props NEVER alert
+  WHALE_ACCUM_WINDOW_MIN -- RETIRED, ignored
+Leagues: MLB, NFL, NBA, NHL.
 """
 import os
+import re
 import time
 import sqlite3
 import asyncio
@@ -36,14 +46,16 @@ log = logging.getLogger("whale")
 PM_TRADES = "https://data-api.polymarket.com/trades"
 KALSHI_TRADES = "https://external-api.kalshi.com/trade-api/v2/markets/trades"
 
-GAME_MIN = float(os.getenv("WHALE_GAME_MIN", "50000") or 50000)
+GAME_MIN = float(os.getenv("WHALE_GAME_MIN", "250000") or 250000)
 PROP_MIN = float(os.getenv("WHALE_PROP_MIN", "5000") or 5000)
 POLL_MIN = max(1, int(os.getenv("WHALE_POLL_MIN", "3") or 3))
-# Big orders FRAGMENT: a $50K wager sweeps the book as many smaller fills,
-# none of which trips the single-print bar (Mike proved it with his own
-# test bet). So alerts fire two ways: a single print over the bar, OR a
-# wallet/market ACCUMULATING past the bar inside this rolling window.
-ACCUM_WINDOW_MIN = max(5, int(os.getenv("WHALE_ACCUM_WINDOW_MIN", "60") or 60))
+# Big orders FRAGMENT: a $250K wager sweeps the book as many smaller
+# fills, none of which trips the single-print bar (Mike proved it with
+# his own test bet). The burst window keeps that lesson without the old
+# spam: ONE ACTOR (a wallet on Polymarket; a market+side on Kalshi's
+# anonymous tape) summing past the bar inside a few minutes is a whale
+# landing in real time. Market-wide hour-long accumulation is retired.
+BURST_WINDOW_MIN = max(0, int(os.getenv("WHALE_BURST_WINDOW_MIN", "10") or 10))
 CHANNEL_ID = int(os.getenv("WHALE_CHANNEL_ID", "0") or 0)
 DB = os.getenv("WHALE_DB", "whale.db")
 
@@ -61,6 +73,8 @@ def _conn():
         ts INTEGER, PRIMARY KEY (source, trade_id))""")
     c.execute("""CREATE TABLE IF NOT EXISTS whale_accum_alerts (
         akey TEXT PRIMARY KEY, ts INTEGER)""")
+    c.execute("""CREATE TABLE IF NOT EXISTS whale_day_alerts (
+        dkey TEXT PRIMARY KEY, ts INTEGER)""")
     return c
 
 
@@ -72,9 +86,64 @@ def _league_of(text: str) -> str | None:
     return None
 
 
+TOTAL_HINTS = ("total", "o/u", "over/under", "combined", "over ", "under ")
+
+
 def _bucket_of(title: str) -> str:
     t = (title or "").lower()
     return "prop" if any(h in t for h in PROP_HINTS) else "game"
+
+
+def _pm_market_type(title: str) -> str:
+    """moneyline / total / spread / prop for a Polymarket title. Totals
+    checked BEFORE prop hints: 'Total points scored' is a game total,
+    not a points prop."""
+    t = (title or "").lower()
+    if any(h in t for h in TOTAL_HINTS):
+        return "total"
+    if "spread" in t or re.search(r"[+-]\d+\.5", t):
+        return "spread"
+    if any(h in t for h in PROP_HINTS):
+        return "prop"
+    return "moneyline"
+
+
+def _kalshi_market_type(ticker: str) -> str:
+    tu = (ticker or "").upper()
+    if "TOTAL" in tu:
+        return "total"
+    if "SPREAD" in tu:
+        return "spread"
+    if "GAME" in tu:
+        return "moneyline"
+    return "prop"
+
+
+def _alertable(mtype: str) -> bool:
+    """Mike's rule: notifications are moneyline + totals ONLY."""
+    return mtype in ("moneyline", "total")
+
+
+def _et_day(ts: int | None = None) -> str:
+    try:
+        from zoneinfo import ZoneInfo
+        dt = datetime.fromtimestamp(ts or time.time(), tz=ZoneInfo("America/New_York"))
+    except Exception:
+        dt = datetime.fromtimestamp(ts or time.time(), tz=timezone.utc)
+    return dt.strftime("%Y-%m-%d")
+
+
+def _day_dedupe(c, source: str, wallet: str | None, title: str, side: str,
+                ts: int) -> bool:
+    """True exactly once per (market, side, actor) per ET day. Every alert
+    path runs through this -- the same whale laddering, re-printing, or
+    the market staying hot NEVER notifies twice in a day."""
+    dkey = f"{source}|{wallet or ''}|{title}|{side}|{_et_day(ts)}"
+    row = c.execute("SELECT 1 FROM whale_day_alerts WHERE dkey=?", (dkey,)).fetchone()
+    if row:
+        return False
+    c.execute("INSERT OR REPLACE INTO whale_day_alerts VALUES (?, ?)", (dkey, ts))
+    return True
 
 
 KALSHI_MARKET_URL = "https://external-api.kalshi.com/trade-api/v2/markets/{}"
@@ -190,12 +259,13 @@ def poll_polymarket(state: dict) -> list[dict]:
         rows.append(("polymarket", trade_id, wallet, title,
                      (t.get("side") or "").upper(), t.get("outcome") or "",
                      notional, price, bucket, league, ts))
-        if notional >= (GAME_MIN if bucket == "game" else PROP_MIN):
+        mtype = _pm_market_type(title)
+        if _alertable(mtype) and notional >= GAME_MIN:
             alerts.append({"source": "Polymarket", "title": title,
                            "side": (t.get("side") or "").upper(),
                            "outcome": t.get("outcome") or "",
                            "notional": notional, "price": price,
-                           "bucket": bucket, "league": league,
+                           "bucket": bucket, "mtype": mtype, "league": league,
                            "wallet": wallet, "ts": ts})
     if rows:
         with _conn() as c:
@@ -267,12 +337,13 @@ def poll_kalshi(state: dict) -> list[dict]:
         rows.append(("kalshi", trade_id, None, ticker,
                      (t.get("taker_side") or "").upper(), "",
                      notional, price, bucket, league, ts))
-        if notional >= (GAME_MIN if bucket == "game" else PROP_MIN):
+        mtype = _kalshi_market_type(ticker)
+        if _alertable(mtype) and notional >= GAME_MIN:
             alerts.append({"source": "Kalshi", "title": ticker,
                            "side": (t.get("taker_side") or "").upper(),
                            "outcome": "block trade" if t.get("is_block_trade") else "",
                            "notional": notional, "price": price,
-                           "bucket": bucket, "league": league,
+                           "bucket": bucket, "mtype": mtype, "league": league,
                            "wallet": None, "ts": ts})
     if rows:
         with _conn() as c:
@@ -282,43 +353,47 @@ def poll_kalshi(state: dict) -> list[dict]:
     return alerts
 
 
-def accumulation_alerts() -> list[dict]:
-    """Wallets (Polymarket) or markets (Kalshi, anonymous) whose SUMMED
-    fills inside the rolling window crossed the bar without any single
-    print doing so. Alerted once per wallet+market per window-crossing
-    (dedupe table), so a whale laddering in fires exactly one alert."""
-    cutoff = int(time.time()) - ACCUM_WINDOW_MIN * 60
+def burst_alerts() -> list[dict]:
+    """ONE ACTOR crossing the bar in fragments, in real time: a wallet
+    (Polymarket) or a market+side (Kalshi, anonymous tape) whose fills
+    inside the last BURST_WINDOW_MIN sum past GAME_MIN without any single
+    print doing so. Moneyline/total markets only, like every alert. The
+    old rolling-hour market-wide accumulation is gone -- that was crowd
+    volume, not a whale, and it re-fired all day."""
+    if BURST_WINDOW_MIN <= 0:
+        return []
+    cutoff = int(time.time()) - BURST_WINDOW_MIN * 60
     out = []
     with _conn() as c:
         rows = c.execute(
-            "SELECT source, COALESCE(wallet, ''), title, bucket, league, "
-            "SUM(notional), COUNT(*), MAX(notional), MAX(ts) "
+            "SELECT source, COALESCE(wallet, ''), title, side, bucket, league, "
+            "SUM(notional), COUNT(*), MAX(notional), MAX(ts), MAX(price) "
             "FROM whale_trades WHERE ts >= ? "
-            "GROUP BY source, COALESCE(wallet, ''), title", (cutoff,)).fetchall()
-        for src_, wallet, title, bucket, league, total, n, biggest, last_ts in rows:
-            bar = GAME_MIN if bucket == "game" else PROP_MIN
-            if total < bar or biggest >= bar or n < 2:
-                continue  # single big print already alerts on its own
-            akey = f"{src_}|{wallet}|{title}|{int(cutoff / (ACCUM_WINDOW_MIN * 60))}"
-            akey = f"{src_}|{wallet}|{title}"
-            already = c.execute("SELECT ts FROM whale_accum_alerts WHERE akey=?",
-                                (akey,)).fetchone()
-            if already and already[0] >= cutoff:
+            "GROUP BY source, COALESCE(wallet, ''), title, side",
+            (cutoff,)).fetchall()
+        for (src_, wallet, title, side, bucket, league,
+             total, n, biggest, last_ts, last_px) in rows:
+            mtype = (_kalshi_market_type(title) if src_ == "kalshi"
+                     else _pm_market_type(title))
+            if not _alertable(mtype):
                 continue
-            c.execute("INSERT OR REPLACE INTO whale_accum_alerts VALUES (?, ?)",
-                      (akey, last_ts))
+            if total < GAME_MIN or biggest >= GAME_MIN or n < 2:
+                continue  # single big print already alerts on its own
+            if not _day_dedupe(c, src_, wallet or None, title, side or "", last_ts):
+                continue
             out.append({"source": src_.title(), "title": title,
-                        "side": "", "outcome": f"{n} fills in {ACCUM_WINDOW_MIN}m",
-                        "notional": round(total, 2), "price": 0.0,
-                        "bucket": bucket, "league": league,
+                        "side": side or "",
+                        "outcome": f"{n} fills in {BURST_WINDOW_MIN}m",
+                        "notional": round(total, 2), "price": last_px or 0.0,
+                        "bucket": bucket, "mtype": mtype, "league": league,
                         "wallet": wallet or None, "accum": True, "ts": last_ts})
     return out
 
 
 def alert_embed(a: dict) -> discord.Embed:
-    thresh = "game" if a["bucket"] == "game" else "prop"
+    mtype = a.get("mtype") or ("game" if a["bucket"] == "game" else "prop")
     emb = discord.Embed(
-        title=(f"🐋 {_fmt_usd(a['notional'])} accumulated on {a['source']}"
+        title=(f"🐋 {_fmt_usd(a['notional'])} burst on {a['source']}"
                if a.get("accum") else
                f"🐋 {_fmt_usd(a['notional'])} on {a['source']}"),
         description=(f"**{display_title(a['source'], a['title'])}**"
@@ -327,15 +402,20 @@ def alert_embed(a: dict) -> discord.Embed:
         color=0x1B7F4D)
     bits = []
     if a.get("side"):
-        bits.append(a["side"].title())
-    if a.get("outcome"):
+        # the bet, plainly: Kalshi YES/NO on the titled question;
+        # Polymarket BUY/SELL of the named outcome
+        side = a["side"].title()
+        bits.append(f"{side} {a['outcome']}".strip()
+                    if a.get("outcome") and not a.get("accum") else side)
+    elif a.get("outcome") and not a.get("accum"):
         bits.append(a["outcome"])
+    if a.get("price"):
+        bits.append(f"@ {a['price']:.2f} ({a['price']:.0%} implied)")
     if a.get("accum"):
-        bits = [a.get("outcome") or "accumulated"]
-    else:
-        bits.append(f"@ {a['price']:.2f}")
-    emb.add_field(name="Trade", value=" · ".join(bits), inline=True)
-    emb.add_field(name="Bucket", value=f"{a['league'].upper()} {thresh}", inline=True)
+        bits.append(a.get("outcome") or "burst")
+    emb.add_field(name="The bet", value=" · ".join(bits) or "—", inline=True)
+    emb.add_field(name="Market", value=f"{a['league'].upper()} {mtype.title()}",
+                  inline=True)
     if a.get("wallet"):
         w = a["wallet"]
         emb.add_field(name="Wallet", value=f"`{w[:6]}…{w[-4:]}`", inline=True)
@@ -385,9 +465,10 @@ def sharp_board() -> list[dict]:
 
 async def poll_task(bot):
     state: dict = {}
-    log.info("whale watch up — poll %dmin, game>=%s prop>=%s, channel %s",
-             POLL_MIN, _fmt_usd(GAME_MIN), _fmt_usd(PROP_MIN),
-             CHANNEL_ID or "unset (commands only)")
+    log.info("whale watch up — poll %dmin, ML/totals only >= %s, burst %smin, "
+             "channel %s (props/spreads: ledger only, never alert)",
+             POLL_MIN, _fmt_usd(GAME_MIN),
+             BURST_WINDOW_MIN or "off", CHANNEL_ID or "unset (commands only)")
     # first pass primes the last-seen cursors without alert-spamming history
     try:
         await asyncio.to_thread(poll_polymarket, state)
@@ -403,9 +484,25 @@ async def poll_task(bot):
             except Exception as e:
                 log.error("whale poll error: %s", e)
         try:
-            alerts.extend(await asyncio.to_thread(accumulation_alerts))
+            alerts.extend(await asyncio.to_thread(burst_alerts))
         except Exception as e:
-            log.error("whale accumulation error: %s", e)
+            log.error("whale burst error: %s", e)
+        # one alert per market/side/actor per ET day -- prints included,
+        # so a whale re-printing every hour is one notification, not ten
+        def _dedupe_prints(items):
+            keep = []
+            with _conn() as c:
+                for a in items:
+                    if a.get("accum"):
+                        keep.append(a)  # burst path already deduped
+                    elif _day_dedupe(c, a["source"].lower(), a.get("wallet"),
+                                     a["title"], a.get("side") or "", a["ts"]):
+                        keep.append(a)
+            return keep
+        try:
+            alerts = await asyncio.to_thread(_dedupe_prints, alerts)
+        except Exception as e:
+            log.error("whale dedupe error: %s", e)
         if not alerts or not CHANNEL_ID:
             continue
         ch = bot.get_channel(CHANNEL_ID)
@@ -424,7 +521,7 @@ async def whale_callback(interaction: discord.Interaction):
     if not rows:
         await interaction.followup.send(
             "No threshold-size exchange bets in the last 24h "
-            f"(game ≥ {_fmt_usd(GAME_MIN)}, props ≥ {_fmt_usd(PROP_MIN)}).")
+            f"(moneyline/totals ≥ {_fmt_usd(GAME_MIN)}).")
         return
     emb = discord.Embed(title="🐋 Whale watch — last 24h", color=0x1B7F4D)
     lines = []
