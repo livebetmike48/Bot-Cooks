@@ -11,21 +11,27 @@ next to sportsbook steam:
     regulated exchange, anonymous tape -> big prints only, labeled as
     flow, never as named whales.
 
-ALERT POLICY (Mike, Aug 21): notifications fire ONLY on moneyline and
-total markets, ONLY at WHALE_GAME_MIN (default $250,000), and ONLY in
-real time -- a single print over the bar, or one actor's fills summing
-past it inside a short burst window (WHALE_BURST_WINDOW_MIN, default 10;
-0 = single prints only). The old rolling-hour market-wide accumulation
-is GONE -- crowd volume re-crossing a bar all day was the spam. One
-alert per market/side per day, period. Props and spreads still flow
-into the ledger for /whale and /sharp; they never notify.
+ALERT POLICY (Mike, Aug 21 v2): three market classes, two alert bars,
+one real-time rule.
+  Moneylines + game totals  -> alert at WHALE_GAME_MIN (default $250,000)
+  PLAYER props (strikeouts, outs, points, passing yards, ...) -> alert
+      at WHALE_PROP_MIN (default $25,000) -- player props trade thin, a
+      $25K single actor IS the whale there
+  NRFI/YRFI + first-inning markets, spreads, series winners, anything
+      unrecognized -> NEVER notify (ledger only). The old bot's "prop"
+      alerts were almost all NRFI/YRFI -- the liquid junk drowned the
+      real player props. That class is now explicitly silent.
+Real-time = a single print over the class bar, or ONE ACTOR's fills
+summing past it inside the burst window (auto-widened to cover the poll
+gap, so any WHALE_POLL_MIN works). One alert per market/side/actor per
+ET day. /whale and /sharp still see everything.
 
 Env:
-  WHALE_GAME_MIN         default 250000 -- moneyline/total alert bar ($)
+  WHALE_GAME_MIN         default 250000 -- moneyline/total bar ($)
+  WHALE_PROP_MIN         default 25000  -- PLAYER prop bar ($)
   WHALE_BURST_WINDOW_MIN default 10     -- same-actor burst window (0=off)
   WHALE_POLL_MIN         default 3      -- poll cadence, minutes
   WHALE_CHANNEL_ID       -- channel for alerts (unset = commands only)
-  WHALE_PROP_MIN         -- ledger bucket label only; props NEVER alert
   WHALE_ACCUM_WINDOW_MIN -- RETIRED, ignored
 Leagues: MLB, NFL, NBA, NHL.
 """
@@ -47,7 +53,7 @@ PM_TRADES = "https://data-api.polymarket.com/trades"
 KALSHI_TRADES = "https://external-api.kalshi.com/trade-api/v2/markets/trades"
 
 GAME_MIN = float(os.getenv("WHALE_GAME_MIN", "250000") or 250000)
-PROP_MIN = float(os.getenv("WHALE_PROP_MIN", "5000") or 5000)
+PROP_MIN = float(os.getenv("WHALE_PROP_MIN", "25000") or 25000)
 POLL_MIN = max(1, int(os.getenv("WHALE_POLL_MIN", "3") or 3))
 # Big orders FRAGMENT: a $250K wager sweeps the book as many smaller
 # fills, none of which trips the single-print bar (Mike proved it with
@@ -87,6 +93,12 @@ def _league_of(text: str) -> str | None:
 
 
 TOTAL_HINTS = ("total", "o/u", "over/under", "combined", "over ", "under ")
+# first-inning junk that used to masquerade as "props" and spam every day
+INNING_HINTS = ("nrfi", "yrfi", "1st inning", "first inning", "run in the")
+# Kalshi ticker series tokens that mean a PLAYER stat market
+KALSHI_STAT_SERIES = ("PASSYDS", "RUSHYDS", "RECYDS", "RECEP", "PTS", "REB",
+                      "AST", "STRIKEOUT", "SO", "KS", "OUTS", "HITS", "HR",
+                      "TB", "SAVES", "GOALS", "SHOTS", "TDS", "COMP")
 
 
 def _bucket_of(title: str) -> str:
@@ -95,10 +107,12 @@ def _bucket_of(title: str) -> str:
 
 
 def _pm_market_type(title: str) -> str:
-    """moneyline / total / spread / prop for a Polymarket title. Totals
-    checked BEFORE prop hints: 'Total points scored' is a game total,
-    not a points prop."""
+    """moneyline / total / inning / spread / prop for a Polymarket title.
+    Totals before prop hints ('Total points scored' is a game total);
+    first-inning junk named before anything can call it a prop."""
     t = (title or "").lower()
+    if any(h in t for h in INNING_HINTS):
+        return "inning"
     if any(h in t for h in TOTAL_HINTS):
         return "total"
     if "spread" in t or re.search(r"[+-]\d+\.5", t):
@@ -109,19 +123,52 @@ def _pm_market_type(title: str) -> str:
 
 
 def _kalshi_market_type(ticker: str) -> str:
+    """From the ticker alone: inning / moneyline / total / spread /
+    series / prop / other. 'other' gets one shot at the REAL market
+    title (cached) before the alert decision -- never before."""
     tu = (ticker or "").upper()
+    if "RFI" in tu:
+        return "inning"
     if "TOTAL" in tu:
         return "total"
     if "SPREAD" in tu:
         return "spread"
     if "GAME" in tu:
         return "moneyline"
-    return "prop"
+    if "SERIES" in tu:
+        return "series"
+    if any(k in tu for k in KALSHI_STAT_SERIES):
+        return "prop"
+    return "other"
+
+
+def _resolve_other(source: str, title: str, mtype: str) -> str:
+    """A Kalshi 'other' resolves through its real market title exactly
+    once (cached), at alert-decision time only."""
+    if mtype != "other" or (source or "").lower() != "kalshi":
+        return mtype
+    real = kalshi_title(title).lower()
+    if any(h in real for h in INNING_HINTS):
+        return "inning"
+    if any(h in real for h in PROP_HINTS) or " record " in real or "outs" in real:
+        return "prop"
+    if any(h in real for h in TOTAL_HINTS):
+        return "total"
+    return "other"
+
+
+def _bar_for(mtype: str) -> float | None:
+    """The alert bar per market class. None = that class never notifies:
+    first-inning markets, spreads, series winners, unrecognized."""
+    if mtype in ("moneyline", "total"):
+        return GAME_MIN
+    if mtype == "prop":
+        return PROP_MIN
+    return None
 
 
 def _alertable(mtype: str) -> bool:
-    """Mike's rule: notifications are moneyline + totals ONLY."""
-    return mtype in ("moneyline", "total")
+    return _bar_for(mtype) is not None
 
 
 def _et_day(ts: int | None = None) -> str:
@@ -260,7 +307,8 @@ def poll_polymarket(state: dict) -> list[dict]:
                      (t.get("side") or "").upper(), t.get("outcome") or "",
                      notional, price, bucket, league, ts))
         mtype = _pm_market_type(title)
-        if _alertable(mtype) and notional >= GAME_MIN:
+        bar = _bar_for(mtype)
+        if bar is not None and notional >= bar:
             alerts.append({"source": "Polymarket", "title": title,
                            "side": (t.get("side") or "").upper(),
                            "outcome": t.get("outcome") or "",
@@ -338,7 +386,10 @@ def poll_kalshi(state: dict) -> list[dict]:
                      (t.get("taker_side") or "").upper(), "",
                      notional, price, bucket, league, ts))
         mtype = _kalshi_market_type(ticker)
-        if _alertable(mtype) and notional >= GAME_MIN:
+        if mtype == "other" and notional >= PROP_MIN:
+            mtype = _resolve_other("kalshi", ticker, mtype)
+        bar = _bar_for(mtype)
+        if bar is not None and notional >= bar:
             alerts.append({"source": "Kalshi", "title": ticker,
                            "side": (t.get("taker_side") or "").upper(),
                            "outcome": "block trade" if t.get("is_block_trade") else "",
@@ -362,7 +413,10 @@ def burst_alerts() -> list[dict]:
     volume, not a whale, and it re-fired all day."""
     if BURST_WINDOW_MIN <= 0:
         return []
-    cutoff = int(time.time()) - BURST_WINDOW_MIN * 60
+    # a 30-min poll with a 10-min window would drop fills between polls --
+    # the effective window always covers at least one full poll gap
+    eff_window = max(BURST_WINDOW_MIN, POLL_MIN + 2)
+    cutoff = int(time.time()) - eff_window * 60
     out = []
     with _conn() as c:
         rows = c.execute(
@@ -375,15 +429,19 @@ def burst_alerts() -> list[dict]:
              total, n, biggest, last_ts, last_px) in rows:
             mtype = (_kalshi_market_type(title) if src_ == "kalshi"
                      else _pm_market_type(title))
-            if not _alertable(mtype):
+            bar = _bar_for(mtype)
+            if bar is None and mtype == "other" and total >= PROP_MIN:
+                mtype = _resolve_other(src_, title, mtype)
+                bar = _bar_for(mtype)
+            if bar is None:
                 continue
-            if total < GAME_MIN or biggest >= GAME_MIN or n < 2:
+            if total < bar or biggest >= bar or n < 2:
                 continue  # single big print already alerts on its own
             if not _day_dedupe(c, src_, wallet or None, title, side or "", last_ts):
                 continue
             out.append({"source": src_.title(), "title": title,
                         "side": side or "",
-                        "outcome": f"{n} fills in {BURST_WINDOW_MIN}m",
+                        "outcome": f"{n} fills in {eff_window}m",
                         "notional": round(total, 2), "price": last_px or 0.0,
                         "bucket": bucket, "mtype": mtype, "league": league,
                         "wallet": wallet or None, "accum": True, "ts": last_ts})
@@ -414,7 +472,9 @@ def alert_embed(a: dict) -> discord.Embed:
     if a.get("accum"):
         bits.append(a.get("outcome") or "burst")
     emb.add_field(name="The bet", value=" · ".join(bits) or "—", inline=True)
-    emb.add_field(name="Market", value=f"{a['league'].upper()} {mtype.title()}",
+    label = {"moneyline": "Moneyline", "total": "Total", "prop": "Player Prop",
+             "inning": "1st Inning", "spread": "Spread"}.get(mtype, mtype.title())
+    emb.add_field(name="Market", value=f"{a['league'].upper()} {label}",
                   inline=True)
     if a.get("wallet"):
         w = a["wallet"]
@@ -465,9 +525,9 @@ def sharp_board() -> list[dict]:
 
 async def poll_task(bot):
     state: dict = {}
-    log.info("whale watch up — poll %dmin, ML/totals only >= %s, burst %smin, "
-             "channel %s (props/spreads: ledger only, never alert)",
-             POLL_MIN, _fmt_usd(GAME_MIN),
+    log.info("whale watch up — poll %dmin, ML/totals >= %s, player props >= %s, "
+             "burst %smin, channel %s (NRFI/inning + spreads: ledger only)",
+             POLL_MIN, _fmt_usd(GAME_MIN), _fmt_usd(PROP_MIN),
              BURST_WINDOW_MIN or "off", CHANNEL_ID or "unset (commands only)")
     # first pass primes the last-seen cursors without alert-spamming history
     try:
@@ -521,7 +581,7 @@ async def whale_callback(interaction: discord.Interaction):
     if not rows:
         await interaction.followup.send(
             "No threshold-size exchange bets in the last 24h "
-            f"(moneyline/totals ≥ {_fmt_usd(GAME_MIN)}).")
+            f"(ML/totals ≥ {_fmt_usd(GAME_MIN)}, player props ≥ {_fmt_usd(PROP_MIN)}).")
         return
     emb = discord.Embed(title="🐋 Whale watch — last 24h", color=0x1B7F4D)
     lines = []
