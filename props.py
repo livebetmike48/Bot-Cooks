@@ -38,7 +38,7 @@ log = logging.getLogger("props")
 
 ET = ZoneInfo("America/New_York")
 ENABLED = os.getenv("PROPS", "1") not in ("0", "false", "off")
-POLL_MIN = max(2, int(os.getenv("PROPS_POLL_MIN", "10") or 10))
+POLL_MIN = max(1, int(os.getenv("PROPS_POLL_MIN", "10") or 10))
 DB = os.getenv("PROPS_DB", "props.db")
 BOOKS = [b.strip().lower() for b in os.getenv(
     "PROPS_BOOKS", "fanduel,draftkings,betmgm,williamhill_us").split(",") if b.strip()]
@@ -89,6 +89,9 @@ def _conn():
               "(day, market, player, book, ts)")
     c.execute("""CREATE TABLE IF NOT EXISTS props_open_alerts (
         day TEXT, market TEXT, player TEXT, PRIMARY KEY (day, market, player))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS props_open_alerts_ev (
+        event_id TEXT, market TEXT, player TEXT,
+        PRIMARY KEY (event_id, market, player))""")
     return c
 
 
@@ -141,8 +144,9 @@ def extract_quotes(event_data: dict) -> dict[tuple[str, str, str], dict]:
 def record_poll(quotes: dict[tuple[str, str, str], dict], event_id: str,
                 ts: int | None = None) -> tuple[int, list[dict]]:
     """Snapshot changed quotes; return (rows_written, openings).
-    An opening = first quote seen today for (market, pitcher) in an
-    OPENER market — once per day, restart-safe via props_open_alerts."""
+    An opening = first quote EVER seen for (game, market, pitcher) in an
+    OPENER market — once per game, restart-safe, immune to the midnight
+    rollover (props open the evening before)."""
     ts = ts or int(time.time())
     day = _today()
     wrote = 0
@@ -161,11 +165,11 @@ def record_poll(quotes: dict[tuple[str, str, str], dict], event_id: str,
                 wrote += 1
             if market in OPENER_MARKETS:
                 seen = c.execute(
-                    "SELECT 1 FROM props_open_alerts WHERE day=? AND market=? "
-                    "AND player=?", (day, market, player)).fetchone()
+                    "SELECT 1 FROM props_open_alerts_ev WHERE event_id=? AND "
+                    "market=? AND player=?", (event_id, market, player)).fetchone()
                 if not seen:
-                    c.execute("INSERT OR IGNORE INTO props_open_alerts VALUES (?,?,?)",
-                              (day, market, player))
+                    c.execute("INSERT OR IGNORE INTO props_open_alerts_ev "
+                              "VALUES (?,?,?)", (event_id, market, player))
                     opened_keys.append((market, player))
     openings = []
     for market, player in opened_keys:
@@ -187,7 +191,7 @@ def opener_embeds(openings: list[dict]) -> list[tuple[str, discord.Embed]]:
                  f"(O {_fmt(q.get('over'))}/U {_fmt(q.get('under'))})"
                  for b, q in sorted(o["books"].items())]
         e.description = "\n".join(lines) or "—"
-        e.set_footer(text="first quote seen today • /propgraph for the chart")
+        e.set_footer(text="opening line • /propgraph for the chart")
         out.append((mk, e))
     return out
 
