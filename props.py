@@ -269,11 +269,16 @@ def movers(market: str | None = None):
     open_row, now_row)] sorted by |line change|; price_moves (same line only)
     = [(prob_pts, mk, player, book, open_row, now_row)] sorted by Over-price
     probability-point change. No averaging — every row is one real book."""
+    BATTER = {"batter_hits", "batter_total_bases", "batter_hits_runs_rbis"}
     line_moves, price_moves = [], []
     for mk, p, b, o, n in open_now(None, market):
         _, ol, oo, ou = o
         _, nl, no, nu = n
         if ol is not None and nl is not None and ol != nl:
+            # batter lines snapping to/from 0.5 = routine lineup-lock
+            # re-posting (Mike: "pretty normal"), not movement worth ranking
+            if mk in BATTER and 0.5 in (ol, nl):
+                continue
             line_moves.append((abs(nl - ol), mk, p, b, o, n))
         elif oo is not None and no is not None and oo != no:
             i0, i1 = _imp(oo), _imp(no)
