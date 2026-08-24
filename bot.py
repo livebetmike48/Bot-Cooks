@@ -295,6 +295,38 @@ def parlay_ticket(priced_legs: list, same_game: bool, verb: str = "Parlay",
 import random
 
 
+def _et_today() -> str:
+    return (datetime.now(timezone.utc) - timedelta(hours=4)).strftime("%Y-%m-%d")
+
+
+def _avg_price(prices: dict) -> float | None:
+    clean = list(_strip_offshore(prices).values())
+    return round(sum(clean) / len(clean), 1) if clean else None
+
+
+# Daily auto-parlays (one per category, staggered) -- set the channel to arm:
+AUTOPOST_CHANNEL_ID = int(os.getenv("PARLAY_AUTOPOST_CHANNEL_ID", "0") or 0)
+AUTOPOST_START_UTC = os.getenv("PARLAY_AUTOPOST_START_UTC", "15:00")  # 11am ET
+AUTOPOST_GAP_MIN = max(5, int(os.getenv("PARLAY_AUTOPOST_GAP_MIN", "15") or 15))
+AUTOPOST_CATEGORIES = os.getenv("PARLAY_AUTOPOST_CATEGORIES",
+                                "hr,hit,k,moneyline,totals")
+
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("parlay_bot")
+
+intents = discord.Intents.default()
+
+MARKET_CONFIG = {
+    "hit": {"title": "🎯 Hit Parlay", "shortlist_pct": "xba",
+            "note": "ranked by real xBA vs the starter's hand"},
+    "hr": {"title": "💣 HR Parlay", "shortlist_pct": "brl_percent",
+           "note": "ranked by real xwOBA vs the starter's hand"},
+}
+
+
 def diversify(evaluated: list, want: int) -> list:
     """Same data, different ticket. The top of the shortlist is a cluster of
     near-equal candidates -- always taking 1..N means every user gets the
