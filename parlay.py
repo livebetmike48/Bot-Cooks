@@ -242,6 +242,41 @@ def evaluate_k_leg(starter_id: int, starter_name: str, team: str, opponent: str)
     }
 
 
+# ---- confidence bars: leg count is an OUTPUT of these, never a preset ----
+# Each bar sits on the market's REAL ranking stat, set meaningfully above
+# league level so a qualifying leg means something. League refs in comments.
+import os as _os
+QUALITY_BARS = {
+    "hit":       ("xba_vs_hand",  0.285),  # league xBA ~ .245
+    "single":    ("avg_vs_hand",  0.285),
+    "hr":        ("xwoba_vs_hand", 0.380), # league xwOBA ~ .315
+    "k":         ("rank_metric",  27.0),   # max-side K%; league ~ 22%
+    "moneyline": ("rank_metric",  0.030),  # xwOBA-against gap between starters
+}
+MIN_LEGS = max(1, int(_os.getenv("PARLAY_MIN_LEGS", "2") or 2))
+# No ceiling by default — if 7 legs clear the bar, the bot sends 7.
+# Set PARLAY_MAX_LEGS to a number only if you ever want a cap back.
+MAX_LEGS = int(_os.getenv("PARLAY_MAX_LEGS", "0") or 0)  # 0 = unlimited
+
+
+def qualified_legs(legs: list[dict], market: str) -> list[dict]:
+    """Legs that clear the market's real-stat bar, best first."""
+    stat, bar = QUALITY_BARS.get(market, ("rank_metric", 0))
+    good = [l for l in legs if (l.get(stat) or 0) >= bar]
+    return sorted(good, key=lambda x: -(x.get("rank_metric") or 0))
+
+
+def auto_leg_count(legs: list[dict], market: str) -> tuple[int, int, tuple]:
+    """(count, n_qualified, (stat, bar)). Every leg that clears the bar
+    plays -- no ceiling unless PARLAY_MAX_LEGS is set. 0 means fewer than
+    MIN_LEGS cleared -- the honest answer is no parlay, not a padded one."""
+    stat, bar = QUALITY_BARS.get(market, ("rank_metric", 0))
+    n = len(qualified_legs(legs, market))
+    if n < MIN_LEGS:
+        return 0, n, (stat, bar)
+    return (n if MAX_LEGS <= 0 else min(n, MAX_LEGS)), n, (stat, bar)
+
+
 def pick_legs(legs: list[dict], game_of: dict, count: int, max_per_game: int | None = None) -> list[dict]:
     """Top `count` legs by rank metric. max_per_game=1 restores classic
     one-leg-per-game diversification; None lets the best legs win even if
