@@ -166,9 +166,9 @@ async def poll_task(bot):
 
 # ------------------------------------------------------------------ queries
 
-def open_now(player: str, market: str | None = None):
+def open_now(player: str | None, market: str | None = None):
     """[(market, matched_player, book, open_row, now_row)] for today.
-    Rows are (ts, line, over, under)."""
+    Rows are (ts, line, over, under). player=None matches everyone."""
     day = _today()
     with _conn() as c:
         rows = c.execute(
@@ -177,7 +177,7 @@ def open_now(player: str, market: str | None = None):
     firsts: dict[tuple, tuple] = {}
     lasts: dict[tuple, tuple] = {}
     for mk, p, b, ts, line, over, under in rows:
-        if player.lower() not in p.lower():
+        if player and player.lower() not in p.lower():
             continue
         if market and mk != market:
             continue
@@ -255,6 +255,35 @@ def render_graph(player: str, market: str) -> io.BytesIO | None:
     return buf
 
 
+def _imp(american) -> float | None:
+    """American odds -> implied probability (0..1)."""
+    if american is None:
+        return None
+    a = float(american)
+    return 100.0 / (a + 100.0) if a > 0 else -a / (-a + 100.0)
+
+
+def movers(market: str | None = None):
+    """Today's biggest movers from stored quotes. Returns
+    (line_moves, price_moves): line_moves = [(delta_line, mk, player, book,
+    open_row, now_row)] sorted by |line change|; price_moves (same line only)
+    = [(prob_pts, mk, player, book, open_row, now_row)] sorted by Over-price
+    probability-point change. No averaging — every row is one real book."""
+    line_moves, price_moves = [], []
+    for mk, p, b, o, n in open_now(None, market):
+        _, ol, oo, ou = o
+        _, nl, no, nu = n
+        if ol is not None and nl is not None and ol != nl:
+            line_moves.append((abs(nl - ol), mk, p, b, o, n))
+        elif oo is not None and no is not None and oo != no:
+            i0, i1 = _imp(oo), _imp(no)
+            if i0 is not None and i1 is not None:
+                price_moves.append((abs(i1 - i0) * 100, mk, p, b, o, n))
+    line_moves.sort(key=lambda x: -x[0])
+    price_moves.sort(key=lambda x: -x[0])
+    return line_moves, price_moves
+
+
 # ------------------------------------------------------------------ commands
 
 def _move_line(open_row, now_row) -> str:
@@ -270,28 +299,56 @@ def _move_line(open_row, now_row) -> str:
 def setup(bot):
     tree = bot.tree
 
-    @tree.command(name="prop", description="A player's props: opening line → current, per book")
-    @app_commands.describe(player="Player name (partial fine)",
-                           market="Optional: one market only")
+    @tree.command(name="prop",
+                  description="Open → current per book: one player, or a whole market")
+    @app_commands.describe(player="Optional: player name (partial fine). Omit for the whole market",
+                           market="Optional: one market")
     @app_commands.choices(market=CHOICES)
-    async def prop_cmd(interaction: discord.Interaction, player: str,
+    async def prop_cmd(interaction: discord.Interaction,
+                       player: str | None = None,
                        market: app_commands.Choice[str] | None = None):
         await interaction.response.defer()
+        if not player and not market:
+            await interaction.followup.send(
+                "Give me a player, a market, or both — e.g. `/prop skubal`, "
+                "`/prop market:Outs`, `/prop skubal market:K's`.")
+            return
         rows = open_now(player, market.value if market else None)
         if not rows:
+            who = f"“{player}”" if player else "anyone"
             await interaction.followup.send(
-                f"No tracked quotes for “{player}” today"
+                f"No tracked quotes for {who} today"
                 + (f" on {market.name}" if market else "") + ".")
             return
-        by_mp: dict[tuple[str, str], list] = {}
+        if player:
+            by_mp: dict[tuple[str, str], list] = {}
+            for mk, p, b, o, n in rows:
+                by_mp.setdefault((mk, p), []).append((b, o, n))
+            e = discord.Embed(title=f"Props — {rows[0][1]}", color=0x3498db)
+            for (mk, p), items in sorted(by_mp.items()):
+                val = "\n".join(f"{BOOK_NAMES.get(b, b)}: {_move_line(o, n)}"
+                                 for b, o, n in sorted(items))
+                e.add_field(name=MARKETS.get(mk, mk), value=val[:1024], inline=False)
+            e.set_footer(text="open = first quote the tracker saw today")
+            await interaction.followup.send(embed=e)
+            return
+        # market-only: the whole slate, movers first, unmoved collapsed
+        by_p: dict[str, list] = {}
         for mk, p, b, o, n in rows:
-            by_mp.setdefault((mk, p), []).append((b, o, n))
-        e = discord.Embed(title=f"Props — {rows[0][1]}", color=0x3498db)
-        for (mk, p), items in sorted(by_mp.items()):
-            val = "\n".join(f"{BOOK_NAMES.get(b, b)}: {_move_line(o, n)}"
-                            for b, o, n in sorted(items))
-            e.add_field(name=MARKETS.get(mk, mk), value=val[:1024], inline=False)
-        e.set_footer(text="open = first quote the tracker saw today")
+            by_p.setdefault(p, []).append((b, o, n))
+        def _pscore(items):
+            return max((abs((n[1] or 0) - (o[1] or 0)) for _, o, n in items), default=0)
+        e = discord.Embed(title=f"{market.name} — open → now (whole slate)",
+                          color=0x3498db)
+        for p in sorted(by_p, key=lambda x: -_pscore(by_p[x]))[:24]:
+            moved = [(b, o, n) for b, o, n in sorted(by_p[p]) if o[1:] != n[1:]]
+            still = len(by_p[p]) - len(moved)
+            lines = [f"{BOOK_NAMES.get(b, b)}: {_move_line(o, n)}" for b, o, n in moved]
+            if still:
+                ref = by_p[p][0]
+                lines.append(f"{still} book(s) unmoved at {ref[2][1]}")
+            e.add_field(name=p, value="\n".join(lines)[:1024], inline=False)
+        e.set_footer(text="sorted by biggest line change • open = first quote seen today")
         await interaction.followup.send(embed=e)
 
     @tree.command(name="propboard", description="Current slate board for one market")
@@ -310,6 +367,37 @@ def setup(bot):
                      f"(O {_fmt(q[2])}/U {_fmt(q[3])})"
                      for bk, q in sorted(b[p].items())]
             e.add_field(name=p, value="\n".join(lines), inline=True)
+        await interaction.followup.send(embed=e)
+
+    @tree.command(name="propmoves",
+                  description="Biggest prop movers today — line moves + price moves")
+    @app_commands.describe(market="Optional: one market. Omit = all seven")
+    @app_commands.choices(market=CHOICES)
+    async def propmoves_cmd(interaction: discord.Interaction,
+                            market: app_commands.Choice[str] | None = None):
+        await interaction.response.defer()
+        lm, pm = movers(market.value if market else None)
+        if not lm and not pm:
+            await interaction.followup.send(
+                "Nothing has moved yet today"
+                + (f" in {market.name}" if market else "") + ".")
+            return
+        e = discord.Embed(title="Biggest prop movers today"
+                          + (f" — {market.name}" if market else ""),
+                          color=0xe67e22)
+        if lm:
+            val = "\n".join(
+                f"**{p}** {MARKETS.get(mk, mk)} — {BOOK_NAMES.get(b, b)}: "
+                f"{o[1]} → {n[1]} (O {_fmt(o[2])} → {_fmt(n[2])})"
+                for _, mk, p, b, o, n in lm[:10])
+            e.add_field(name="📏 Line moves", value=val[:1024], inline=False)
+        if pm:
+            val = "\n".join(
+                f"**{p}** {MARKETS.get(mk, mk)} — {BOOK_NAMES.get(b, b)}: "
+                f"O {_fmt(o[2])} → {_fmt(n[2])} at {n[1]} ({pts:.1f} pts)"
+                for pts, mk, p, b, o, n in pm[:10])
+            e.add_field(name="💰 Price moves (same line)", value=val[:1024], inline=False)
+        e.set_footer(text="every row is one real book • price moves ranked in probability points")
         await interaction.followup.send(embed=e)
 
     @tree.command(name="propgraph",
