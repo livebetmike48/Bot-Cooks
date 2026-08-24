@@ -752,6 +752,13 @@ class ParlayBot(discord.Client):
                 "(books pull props once games go live; lines post closer to game time).")
             return
 
+        if legs == 0:  # autopost: the bot sizes the ticket off real bars
+            legs, n_q, (stat, bar) = parlay.auto_leg_count(evaluated, market)
+            if legs == 0:
+                await interaction.followup.send(
+                    f"No {market} parlay today — only {n_q} leg(s) cleared the "
+                    f"quality bar ({stat} ≥ {bar}). Not padding a weak ticket.")
+                return
         chosen = _fresh_pick("hr" if market == "hr" else "hit",
                              evaluated, game_of, legs)
 
@@ -840,6 +847,13 @@ class ParlayBot(discord.Client):
                 "Starters found, but none have a live strikeouts prop right now "
                 "(K props post closer to game time).")
             return
+        if legs == 0:
+            legs, n_q, (stat, bar) = parlay.auto_leg_count(gated, "k")
+            if legs == 0:
+                await interaction.followup.send(
+                    f"No K parlay today — only {n_q} starter(s) cleared the "
+                    f"quality bar (max-side K% ≥ {bar}). Not padding a weak ticket.")
+                return
         chosen = _fresh_pick("k", gated, game_of, legs)
         priced_legs, k_lines = [], {}
         for leg in chosen:
@@ -1131,6 +1145,13 @@ class ParlayBot(discord.Client):
             else:
                 await interaction.followup.send("No moneyline legs have live prices right now.")
             return
+        if legs == 0:
+            legs, n_q, (stat, bar) = parlay.auto_leg_count(evaluated, "moneyline")
+            if legs == 0:
+                await interaction.followup.send(
+                    f"No moneyline parlay today — only {n_q} game(s) had a real "
+                    f"starter-quality gap (xwOBA gap ≥ {bar}). Not padding a weak ticket.")
+                return
         chosen = _fresh_pick("moneyline", evaluated, game_of, legs, max_per_game=1)
 
         priced_legs = []
@@ -1297,11 +1318,11 @@ async def _autopost_task(bot: "ParlayBot"):
     log.info("autopost task up — %02d:%02d UTC, %d categories, %dmin gaps",
              hh, mm, len(cats), AUTOPOST_GAP_MIN)
     runners = {
-        "hr": lambda ai: bot._batter_parlay(ai, "hr", 3),
-        "hit": lambda ai: bot._batter_parlay(ai, "hit", 3),
-        "k": lambda ai: bot._strikeouts_callback(ai, 3),
+        "hr": lambda ai: bot._batter_parlay(ai, "hr", 0),      # 0 = bot sizes it
+        "hit": lambda ai: bot._batter_parlay(ai, "hit", 0),
+        "k": lambda ai: bot._strikeouts_callback(ai, 0),
         "streak": lambda ai: bot._streak_callback(ai),
-        "moneyline": lambda ai: bot._moneyline_callback(ai, 3),
+        "moneyline": lambda ai: bot._moneyline_callback(ai, 0),
         "totals": lambda ai: bot._totals_callback(ai),
     }
     while True:
