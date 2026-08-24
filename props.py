@@ -45,6 +45,28 @@ BOOKS = [b.strip().lower() for b in os.getenv(
 BOOK_NAMES = {"fanduel": "FanDuel", "draftkings": "DraftKings",
               "betmgm": "BetMGM", "williamhill_us": "Caesars"}
 
+# Openers feed: pitcher markets only, posted once per pitcher per market per
+# day to PROPS_OPENERS_CHANNEL_ID via a webhook displaying as "Openers"
+# (needs Manage Webhooks; falls back to a normal bot post without it).
+# Unset = no posts at all; everything else stays command-only.
+OPENERS_CHANNEL_ID = int(os.getenv("PROPS_OPENERS_CHANNEL_ID", "0") or 0)
+OPENER_NAME = os.getenv("PROPS_OPENERS_NAME", "Openers")
+OPENER_MARKETS = {"pitcher_outs", "pitcher_strikeouts",
+                  "pitcher_hits_allowed", "pitcher_walks"}
+
+def _cid(var: str) -> int:
+    return int(os.getenv(var, "0") or 0)
+
+# Per-market channels (Mike's openers category). Any market without its own
+# var falls back to PROPS_OPENERS_CHANNEL_ID; no channel at all = no post.
+OPENER_CHANNEL_BY_MARKET = {
+    "pitcher_outs":         _cid("PROPS_OPENERS_OUTS_ID") or OPENERS_CHANNEL_ID,
+    "pitcher_strikeouts":   _cid("PROPS_OPENERS_KS_ID") or OPENERS_CHANNEL_ID,
+    "pitcher_hits_allowed": _cid("PROPS_OPENERS_HA_ID") or OPENERS_CHANNEL_ID,
+    "pitcher_walks":        _cid("PROPS_OPENERS_WALKS_ID") or OPENERS_CHANNEL_ID,
+}
+
+
 MARKETS = {
     "pitcher_outs": "Outs",
     "pitcher_strikeouts": "K's",
@@ -65,6 +87,8 @@ def _conn():
         book TEXT, line REAL, over INTEGER, under INTEGER)""")
     c.execute("CREATE INDEX IF NOT EXISTS ix_ph ON props_history "
               "(day, market, player, book, ts)")
+    c.execute("""CREATE TABLE IF NOT EXISTS props_open_alerts (
+        day TEXT, market TEXT, player TEXT, PRIMARY KEY (day, market, player))""")
     return c
 
 
@@ -115,11 +139,14 @@ def extract_quotes(event_data: dict) -> dict[tuple[str, str, str], dict]:
 
 
 def record_poll(quotes: dict[tuple[str, str, str], dict], event_id: str,
-                ts: int | None = None) -> int:
-    """Snapshot changed quotes only. Returns rows written. Never speaks."""
+                ts: int | None = None) -> tuple[int, list[dict]]:
+    """Snapshot changed quotes; return (rows_written, openings).
+    An opening = first quote seen today for (market, pitcher) in an
+    OPENER market — once per day, restart-safe via props_open_alerts."""
     ts = ts or int(time.time())
     day = _today()
     wrote = 0
+    opened_keys = []
     with _conn() as c:
         for (market, player, book), q in quotes.items():
             last = c.execute(
@@ -132,18 +159,97 @@ def record_poll(quotes: dict[tuple[str, str, str], dict], event_id: str,
                 c.execute("INSERT INTO props_history VALUES (?,?,?,?,?,?,?,?,?)",
                           (ts, day, event_id, market, player, book, *cur))
                 wrote += 1
-    return wrote
+            if market in OPENER_MARKETS:
+                seen = c.execute(
+                    "SELECT 1 FROM props_open_alerts WHERE day=? AND market=? "
+                    "AND player=?", (day, market, player)).fetchone()
+                if not seen:
+                    c.execute("INSERT OR IGNORE INTO props_open_alerts VALUES (?,?,?)",
+                              (day, market, player))
+                    opened_keys.append((market, player))
+    openings = []
+    for market, player in opened_keys:
+        books = {b: q for (mk, p, b), q in quotes.items()
+                 if mk == market and p == player}
+        openings.append({"market": market, "player": player, "books": books})
+    return wrote, openings
 
 
-async def poll_once() -> int:
+def opener_embeds(openings: list[dict]) -> list[tuple[str, discord.Embed]]:
+    """[(market, embed)] — one embed per market per poll batch, routed per
+    market to its own channel."""
+    by_mk: dict[str, list[dict]] = {}
+    for o in openings:
+        by_mk.setdefault(o["market"], []).append(o)
+    out = []
+    for mk, items in by_mk.items():
+        e = discord.Embed(title=f"🟢 {MARKETS.get(mk, mk)} openers",
+                          color=0x2ecc71)
+        for o in items[:24]:
+            lines = [f"{BOOK_NAMES.get(b, b)}: {q.get('line')} "
+                     f"(O {_fmt(q.get('over'))}/U {_fmt(q.get('under'))})"
+                     for b, q in sorted(o["books"].items())]
+            e.add_field(name=o["player"], value="\n".join(lines) or "—",
+                        inline=True)
+        if len(items) > 24:
+            e.add_field(name="…", value=f"+{len(items)-24} more", inline=True)
+        e.set_footer(text="first quote seen today • /propgraph <pitcher> for the chart")
+        out.append((mk, e))
+    return out
+
+
+_webhook_cache: dict[int, object] = {}
+
+
+async def _send_as_openers(bot, channel_id: int, embeds: list[discord.Embed]):
+    """Post via a webhook displaying as OPENER_NAME; plain bot post fallback."""
+    ch = bot.get_channel(channel_id)
+    if not ch:
+        log.warning("openers channel %d not found", channel_id)
+        return
+    wh = _webhook_cache.get(channel_id)
+    if wh is None:
+        try:
+            hooks = await ch.webhooks()
+            wh = next((h for h in hooks if h.name == "LBM Openers"), None)
+            if wh is None:
+                wh = await ch.create_webhook(name="LBM Openers")
+            _webhook_cache[channel_id] = wh
+        except Exception:
+            log.warning("no Manage Webhooks in channel %d — posting as the bot",
+                        channel_id)
+            _webhook_cache[channel_id] = False
+            wh = False
+    for e in embeds:
+        try:
+            if wh:
+                await wh.send(embed=e, username=OPENER_NAME)
+            else:
+                await ch.send(embed=e)
+        except Exception:
+            log.exception("opener send failed")
+
+
+async def poll_once(bot=None) -> int:
     events = await asyncio.to_thread(odds_api.get_events)
     wrote = 0
+    openings_all: list[dict] = []
     for ev in events or []:
         data = await asyncio.to_thread(odds_api.get_event_props, ev.get("id"),
                                        MARKET_PARAM)
         if not data:
             continue
-        wrote += record_poll(extract_quotes(data), ev.get("id") or "")
+        w, opens = record_poll(extract_quotes(data), ev.get("id") or "")
+        wrote += w
+        openings_all.extend(opens)
+    if openings_all and bot is not None:
+        by_ch: dict[int, list] = {}
+        for mk, e in opener_embeds(openings_all):
+            cid = OPENER_CHANNEL_BY_MARKET.get(mk, 0)
+            if cid:
+                by_ch.setdefault(cid, []).append(e)
+        for cid, es in by_ch.items():
+            await _send_as_openers(bot, cid, es)
     return wrote
 
 
@@ -152,11 +258,14 @@ async def poll_task(bot):
         log.info("PROPS=0 — props tracker off")
         return
     await bot.wait_until_ready()
-    log.info("Props tracker: silent polling every %dm, %d markets, books %s "
-             "— command-only output", POLL_MIN, len(MARKETS), ",".join(BOOKS))
+    log.info("Props tracker: polling every %dm, %d markets, books %s — "
+             "openers feed %s", POLL_MIN, len(MARKETS), ",".join(BOOKS),
+             (f"as '{OPENER_NAME}' -> " + ",".join(
+                 f"{MARKETS[m]}:{c}" for m, c in OPENER_CHANNEL_BY_MARKET.items() if c))
+             if any(OPENER_CHANNEL_BY_MARKET.values()) else "OFF (command-only)")
     while not bot.is_closed():
         try:
-            n = await poll_once()
+            n = await poll_once(bot)
             if n:
                 log.info("props: %d snapshots stored", n)
         except Exception:
