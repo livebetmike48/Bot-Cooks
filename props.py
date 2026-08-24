@@ -176,24 +176,18 @@ def record_poll(quotes: dict[tuple[str, str, str], dict], event_id: str,
 
 
 def opener_embeds(openings: list[dict]) -> list[tuple[str, discord.Embed]]:
-    """[(market, embed)] — one embed per market per poll batch, routed per
-    market to its own channel."""
-    by_mk: dict[str, list[dict]] = {}
-    for o in openings:
-        by_mk.setdefault(o["market"], []).append(o)
+    """[(market, embed)] — ONE embed per pitcher per market, sent the poll
+    it first appears (real time), routed to that market's channel."""
     out = []
-    for mk, items in by_mk.items():
-        e = discord.Embed(title=f"🟢 {MARKETS.get(mk, mk)} openers",
+    for o in openings:
+        mk = o["market"]
+        e = discord.Embed(title=f"🟢 {MARKETS.get(mk, mk)} opener — {o['player']}",
                           color=0x2ecc71)
-        for o in items[:24]:
-            lines = [f"{BOOK_NAMES.get(b, b)}: {q.get('line')} "
-                     f"(O {_fmt(q.get('over'))}/U {_fmt(q.get('under'))})"
-                     for b, q in sorted(o["books"].items())]
-            e.add_field(name=o["player"], value="\n".join(lines) or "—",
-                        inline=True)
-        if len(items) > 24:
-            e.add_field(name="…", value=f"+{len(items)-24} more", inline=True)
-        e.set_footer(text="first quote seen today • /propgraph <pitcher> for the chart")
+        lines = [f"{BOOK_NAMES.get(b, b)}: {q.get('line')} "
+                 f"(O {_fmt(q.get('over'))}/U {_fmt(q.get('under'))})"
+                 for b, q in sorted(o["books"].items())]
+        e.description = "\n".join(lines) or "—"
+        e.set_footer(text="first quote seen today • /propgraph for the chart")
         out.append((mk, e))
     return out
 
