@@ -255,8 +255,9 @@ QUALITY_BARS = {
 }
 MIN_LEGS = max(1, int(_os.getenv("PARLAY_MIN_LEGS", "2") or 2))
 # No ceiling by default — if 7 legs clear the bar, the bot sends 7.
-# Set PARLAY_MAX_LEGS to a number only if you ever want a cap back.
-MAX_LEGS = int(_os.getenv("PARLAY_MAX_LEGS", "0") or 0)  # 0 = unlimited
+# Automated sends cap at 3 legs by default (Mike, Aug 27: "parlays
+# getting too big"). PARLAY_MAX_LEGS overrides: 0 = unlimited cook.
+MAX_LEGS = int(_os.getenv("PARLAY_MAX_LEGS", "3") or 0)
 
 
 def qualified_legs(legs: list[dict], market: str) -> list[dict]:
