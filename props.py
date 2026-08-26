@@ -39,7 +39,11 @@ log = logging.getLogger("props")
 ET = ZoneInfo("America/New_York")
 ENABLED = os.getenv("PROPS", "1") not in ("0", "false", "off")
 POLL_MIN = max(1, int(os.getenv("PROPS_POLL_MIN", "10") or 10))
-DB = os.getenv("PROPS_DB", "props.db")
+# Opener->close history is the PRODUCT — it must live on the volume.
+# Default straight to /data so a lost PROPS_DB var can't silently point
+# the tracker at a throwaway in-container file (the amnesia bug).
+DB = os.getenv("PROPS_DB") or (
+    "/data/props.db" if os.path.isdir("/data") else "props.db")
 BOOKS = [b.strip().lower() for b in os.getenv(
     "PROPS_BOOKS", "fanduel,draftkings,betmgm,williamhill_us").split(",") if b.strip()]
 BOOK_NAMES = {"fanduel": "FanDuel", "draftkings": "DraftKings",
@@ -285,6 +289,19 @@ async def poll_task(bot):
         log.info("PROPS=0 — props tracker off")
         return
     await bot.wait_until_ready()
+    try:
+        with _conn() as c:
+            snaps = c.execute("SELECT COUNT(*) FROM props_history").fetchone()[0]
+            days = c.execute("SELECT COUNT(DISTINCT day) FROM props_history").fetchone()[0]
+            evs = c.execute("SELECT COUNT(*) FROM props_events").fetchone()[0]
+        log.info("props db: %s — %d snapshots across %d day(s), %d events on file",
+                 DB, snaps, days, evs)
+        if not DB.startswith("/data"):
+            log.critical("props db %s is NOT on the /data volume — history "
+                         "will NOT survive a deploy. Attach the volume or set "
+                         "PROPS_DB.", DB)
+    except Exception:
+        log.exception("props db receipt failed")
     log.info("Props tracker: polling every %dm, %d markets, books %s — "
              "openers feed %s", POLL_MIN, len(MARKETS), ",".join(BOOKS),
              (f"as '{OPENER_NAME}' -> " + ",".join(
