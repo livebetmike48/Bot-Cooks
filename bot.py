@@ -1157,6 +1157,14 @@ class _AutoInteraction:
         self.channel_id = getattr(channel, "id", None)
 
 
+def _auto_size(default: int) -> int:
+    """Autopost leg count for fixed-size categories: the default, capped
+    by PARLAY_MAX_LEGS when set — so ONE env var caps every automated
+    send. Manual slash commands never route through this."""
+    cap = parlay.MAX_LEGS
+    return min(default, cap) if cap > 0 else default
+
+
 async def _autopost_task(bot: "ParlayBot"):
     """Every day, post one parlay per category on a stagger (11:00,
     11:15, 11:30 ET, ...) even if nobody tags the bot -- the record
@@ -1173,9 +1181,9 @@ async def _autopost_task(bot: "ParlayBot"):
         "hr": lambda ai: bot._batter_parlay(ai, "hr", 0),      # 0 = bot sizes it
         "hit": lambda ai: bot._batter_parlay(ai, "hit", 0),
         "k": lambda ai: bot._strikeouts_callback(ai, 0),
-        "streak": lambda ai: bot._streak_callback(ai),
+        "streak": lambda ai: bot._streak_callback(ai, legs=_auto_size(5)),
         "moneyline": lambda ai: bot._moneyline_callback(ai, 0),
-        "totals": lambda ai: bot._totals_callback(ai),
+        "totals": lambda ai: bot._totals_callback(ai, legs=_auto_size(3)),
     }
     while True:
         now = datetime.now(timezone.utc)
