@@ -92,7 +92,27 @@ def _conn():
     c.execute("""CREATE TABLE IF NOT EXISTS props_open_alerts_ev (
         event_id TEXT, market TEXT, player TEXT,
         PRIMARY KEY (event_id, market, player))""")
+    c.execute("""CREATE TABLE IF NOT EXISTS props_events (
+        event_id TEXT PRIMARY KEY, commence_ts INTEGER)""")
     return c
+
+
+def _iso_ts(s: str | None) -> int | None:
+    """ISO8601 (odds-api commence_time) -> epoch seconds, or None."""
+    if not s:
+        return None
+    try:
+        return int(datetime.fromisoformat(
+            str(s).replace("Z", "+00:00")).timestamp())
+    except Exception:
+        return None
+
+
+def _commence_map() -> dict[str, int]:
+    with _conn() as c:
+        return dict(c.execute(
+            "SELECT event_id, commence_ts FROM props_events "
+            "WHERE commence_ts IS NOT NULL").fetchall())
 
 
 def _today() -> str:
@@ -232,6 +252,15 @@ async def poll_once(bot=None) -> int:
     events = await asyncio.to_thread(odds_api.get_events)
     wrote = 0
     openings_all: list[dict] = []
+    try:
+        with _conn() as c:
+            for ev in events or []:
+                cts = _iso_ts(ev.get("commence_time"))
+                if ev.get("id") and cts:
+                    c.execute("INSERT OR REPLACE INTO props_events "
+                              "VALUES (?,?)", (ev["id"], cts))
+    except Exception:
+        log.exception("props: commence_time store failed")
     for ev in events or []:
         data = await asyncio.to_thread(odds_api.get_event_props, ev.get("id"),
                                        MARKET_PARAM)
@@ -273,17 +302,28 @@ async def poll_task(bot):
 
 # ------------------------------------------------------------------ queries
 
-def open_now(player: str | None, market: str | None = None):
+def open_now(player: str | None, market: str | None = None,
+             pregame_only: bool = False):
     """[(market, matched_player, book, open_row, now_row)] for today.
-    Rows are (ts, line, over, under). player=None matches everyone."""
+    Rows are (ts, line, over, under). player=None matches everyone.
+    pregame_only=True drops every snapshot taken at/after the game's
+    first pitch, so 'now' = the last PRE-GAME quote and in-play lines
+    never rank as movement. Events with no stored commence time are
+    kept (can't judge them) -- the poller records commence for every
+    event it sees, so that gap only covers pre-deploy rows."""
     day = _today()
     with _conn() as c:
         rows = c.execute(
-            "SELECT market, player, book, ts, line, over, under "
+            "SELECT market, player, book, ts, line, over, under, event_id "
             "FROM props_history WHERE day=? ORDER BY ts", (day,)).fetchall()
+    cm = _commence_map() if pregame_only else {}
     firsts: dict[tuple, tuple] = {}
     lasts: dict[tuple, tuple] = {}
-    for mk, p, b, ts, line, over, under in rows:
+    for mk, p, b, ts, line, over, under, ev in rows:
+        if pregame_only:
+            cts = cm.get(ev)
+            if cts and ts >= cts:
+                continue
         if player and player.lower() not in p.lower():
             continue
         if market and mk != market:
@@ -371,14 +411,17 @@ def _imp(american) -> float | None:
 
 
 def movers(market: str | None = None):
-    """Today's biggest movers from stored quotes. Returns
+    """Today's biggest movers from stored quotes -- PREGAME ONLY:
+    snapshots at/after first pitch are excluded, so in-play line jumps
+    (an outs ladder climbing mid-start, a 0-for-3 hits flip) never rank.
+    Returns
     (line_moves, price_moves): line_moves = [(delta_line, mk, player, book,
     open_row, now_row)] sorted by |line change|; price_moves (same line only)
     = [(prob_pts, mk, player, book, open_row, now_row)] sorted by Over-price
     probability-point change. No averaging — every row is one real book."""
     BATTER = {"batter_hits", "batter_total_bases", "batter_hits_runs_rbis"}
     line_moves, price_moves = [], []
-    for mk, p, b, o, n in open_now(None, market):
+    for mk, p, b, o, n in open_now(None, market, pregame_only=True):
         _, ol, oo, ou = o
         _, nl, no, nu = n
         if ol is not None and nl is not None and ol != nl:
@@ -408,6 +451,31 @@ def _move_line(open_row, now_row) -> str:
             f"as of {_tlabel(ts)}")
 
 
+def _guarded(fn):
+    """A crashed command must SAY SO. Without this, an exception after
+    defer() leaves Discord's 'thinking…' spinning forever (the 2-minute
+    /propgraph mystery: matplotlib missing, crash invisible). With it,
+    the user sees the actual error in-channel and the log gets the
+    traceback."""
+    import functools
+
+    @functools.wraps(fn)
+    async def run(interaction, *a, **k):
+        try:
+            await fn(interaction, *a, **k)
+        except Exception as e:
+            log.exception("props command %s failed", fn.__name__)
+            msg = f"⚠️ Command failed — {type(e).__name__}: {e}"
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(msg[:1900])
+                else:
+                    await interaction.response.send_message(msg[:1900])
+            except Exception:
+                pass
+    return run
+
+
 def setup(bot):
     tree = bot.tree
 
@@ -416,6 +484,7 @@ def setup(bot):
     @app_commands.describe(player="Optional: player name (partial fine). Omit for the whole market",
                            market="Optional: one market")
     @app_commands.choices(market=CHOICES)
+    @_guarded
     async def prop_cmd(interaction: discord.Interaction,
                        player: str | None = None,
                        market: app_commands.Choice[str] | None = None):
@@ -465,6 +534,7 @@ def setup(bot):
 
     @tree.command(name="propboard", description="Current slate board for one market")
     @app_commands.choices(market=CHOICES)
+    @_guarded
     async def propboard_cmd(interaction: discord.Interaction,
                             market: app_commands.Choice[str]):
         await interaction.response.defer()
@@ -485,6 +555,7 @@ def setup(bot):
                   description="Biggest prop movers today — line moves + price moves")
     @app_commands.describe(market="Optional: one market. Omit = all seven")
     @app_commands.choices(market=CHOICES)
+    @_guarded
     async def propmoves_cmd(interaction: discord.Interaction,
                             market: app_commands.Choice[str] | None = None):
         await interaction.response.defer()
@@ -509,7 +580,7 @@ def setup(bot):
                 f"O {_fmt(o[2])} → {_fmt(n[2])} at {n[1]} ({pts:.1f} pts)"
                 for pts, mk, p, b, o, n in pm[:10])
             e.add_field(name="💰 Price moves (same line)", value=val[:1024], inline=False)
-        e.set_footer(text="every row is one real book • price moves ranked in probability points")
+        e.set_footer(text="every row is one real book • pregame only — live lines excluded • price moves in probability points")
         await interaction.followup.send(embed=e)
 
     @tree.command(name="propgraph",
@@ -517,6 +588,7 @@ def setup(bot):
     @app_commands.describe(player="Player name (partial fine)",
                            market="Optional: one market. Omit = every prop with data")
     @app_commands.choices(market=CHOICES)
+    @_guarded
     async def propgraph_cmd(interaction: discord.Interaction, player: str,
                             market: app_commands.Choice[str] | None = None):
         await interaction.response.defer()
